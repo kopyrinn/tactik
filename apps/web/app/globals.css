@@ -1,0 +1,50 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: var(--font-base), 'Noto Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+  background-color: #0a0f1e;
+  background-image:
+    radial-gradient(ellipse at 15% 30%, rgba(26, 58, 107, 0.55) 0%, transparent 55%),
+    radial-gradient(ellipse at 85% 10%, rgba(201, 162, 39, 0.18) 0%, transparent 45%),
+    radial-gradient(ellipse at 70% 80%, rgba(74, 144, 217, 0.25) 0%, transparent 50%),
+    radial-gradient(ellipse at 5%  90%, rgba(201, 162, 39, 0.10) 0%, transparent 40%);
+  background-attachment: fixed;
+  color: #ffffff;
+  -webkit-font-smoothing: antialiased;
+}
+
+@layer utilities {
+  .text-gradient {
+    @apply bg-clip-text text-transparent bg-gradient-hero;
+  }
+  
+  .btn-primary {
+    @apply bg-gradient-main text-white px-6 py-3 rounded-lg font-bold uppercase tracking-wide transition-all hover:shadow-xl hover:-translate-y-1;
+  }
+  
+  .btn-secondary {
+    @apply bg-transparent text-ucl-light border-2 border-ucl-light px-6 py-3 rounded-lg font-bold uppercase tracking-wide transition-all hover:bg-ucl-light hover:text-ucl-navy;
+  }
+
+  .input-field {
+    @apply w-full bg-white/5 border border-ucl-blue/40 rounded-lg px-4 py-3 text-white placeholder:text-white/40 focus:border-ucl-light focus:outline-none focus:ring-2 focus:ring-ucl-light/20 transition-all;
+  }
+
+  /* Force readable native select dropdown items across browsers/OS themes */
+  .input-field option {
+    color: #0f172a;
+    background-color: #f8fafc;
+  }
+
+  .card {
+    @apply bg-ucl-blue/10 border border-ucl-blue/30 rounded-xl p-6 hover:border-ucl-gold/50 transition-all;
+  }
+}
