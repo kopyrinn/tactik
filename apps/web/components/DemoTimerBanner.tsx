@@ -37,7 +37,9 @@ export default function DemoTimerBanner() {
   const router = useRouter();
   const pathname = usePathname();
   const isAuthPage = pathname.startsWith('/auth');
+  const isAdminPage = pathname.startsWith('/admin');
   const isSessionPage = pathname.startsWith('/session/');
+  const isHiddenRoute = isAuthPage || isAdminPage || isSessionPage;
   const [marker, setMarker] = useState<DemoAuthMarker | null>(null);
   const [secondsLeft, setSecondsLeft] = useState(0);
   const isFinishingRef = useRef(false);
@@ -65,16 +67,17 @@ export default function DemoTimerBanner() {
   }, [pathname]);
 
   useEffect(() => {
-    if (!marker) return;
+    if (!marker || isHiddenRoute) return;
 
     const timer = setInterval(() => {
       setSecondsLeft(getSecondsLeft(marker.expiresAt));
     }, 1000);
 
     return () => clearInterval(timer);
-  }, [marker]);
+  }, [isHiddenRoute, marker]);
 
   useEffect(() => {
+    if (isAdminPage) return;
     if (!marker) return;
     if (secondsLeft > 0) return;
     if (isFinishingRef.current) return;
@@ -95,7 +98,7 @@ export default function DemoTimerBanner() {
       }
       isFinishingRef.current = false;
     })();
-  }, [marker, pathname, router, secondsLeft]);
+  }, [isAdminPage, marker, pathname, router, secondsLeft]);
 
   const formatted = useMemo(() => {
     const mins = Math.floor(secondsLeft / 60);
@@ -107,7 +110,7 @@ export default function DemoTimerBanner() {
     return null;
   }
 
-  if (isAuthPage || isSessionPage) {
+  if (isHiddenRoute) {
     return null;
   }
 
