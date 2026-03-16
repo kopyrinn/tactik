@@ -4,11 +4,11 @@ import type { SessionState, Drawing, VideoState, SessionParticipant, BoardState,
 import { getSessionState, saveSessionState } from '../redis';
 import { incrementDemoMetric, query, queryOne } from '../db';
 import { generateId } from '../db';
+import { JWT_SECRET } from '../config';
 
 // In-memory session state management
 const activeSessions = new Map<string, SessionState>();
 const FALLBACK_DRAWING_COLOR = '#FF0000';
-const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-this';
 
 type LiveParticipantSnapshot = {
   userId: string;
@@ -255,7 +255,7 @@ export function setupSocketHandlers(io: Server) {
 
         // Validate session exists
         const session = await queryOne<any>(
-          'SELECT * FROM sessions WHERE id = $1 AND is_active = true',
+          'SELECT * FROM sessions WHERE id = $1 AND is_active = 1',
           [sessionId]
         );
 

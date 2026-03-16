@@ -93,8 +93,12 @@ export async function initDatabase() {
       qr_code TEXT,
       board_piece_labels TEXT,
       board_state TEXT,
+      join_code TEXT,
       max_participants INTEGER DEFAULT 2,
       is_active INTEGER DEFAULT 1,
+      is_demo INTEGER DEFAULT 0,
+      demo_expires_at TEXT,
+      demo_room_code TEXT,
       created_at TEXT DEFAULT CURRENT_TIMESTAMP,
       updated_at TEXT DEFAULT CURRENT_TIMESTAMP
     );

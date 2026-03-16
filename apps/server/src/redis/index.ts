@@ -1,161 +1,188 @@
-// In-memory storage as Redis replacement for local development
-const store = new Map<string, { value: string; expiresAt?: number }>();
+import Redis from 'ioredis';
 
-export async function initRedis() {
-  console.log('✅ Using in-memory session storage (development mode)');
-  return store;
-}
+// ---------------------------------------------------------------------------
+// In-memory fallback (development / no REDIS_URL)
+// ---------------------------------------------------------------------------
+const memStore = new Map<string, { value: string; expiresAt?: number }>();
 
-export function getRedis() {
-  return {
-    setex: async (key: string, ttl: number, value: string) => {
-      store.set(key, {
-        value,
-        expiresAt: Date.now() + ttl * 1000,
-      });
-      return 'OK';
-    },
-    
-    get: async (key: string): Promise<string | null> => {
-      const item = store.get(key);
-      if (!item) return null;
-      
-      if (item.expiresAt && Date.now() > item.expiresAt) {
-        store.delete(key);
-        return null;
-      }
-      
-      return item.value;
-    },
-    
-    del: async (key: string) => {
-      store.delete(key);
-      return 1;
-    },
-
-    ping: async () => 'PONG',
-  };
-}
-
-// Session state management
-export async function saveSessionState(sessionId: string, state: any) {
-  store.set(`session:${sessionId}`, {
-    value: JSON.stringify(state),
-    expiresAt: Date.now() + 3600 * 1000, // 1 hour
+function memSet(key: string, value: string, ttlSeconds?: number) {
+  memStore.set(key, {
+    value,
+    expiresAt: ttlSeconds ? Date.now() + ttlSeconds * 1000 : undefined,
   });
 }
 
-export async function getSessionState(sessionId: string): Promise<any | null> {
-  const item = store.get(`session:${sessionId}`);
+function memGet(key: string): string | null {
+  const item = memStore.get(key);
   if (!item) return null;
-  
   if (item.expiresAt && Date.now() > item.expiresAt) {
-    store.delete(`session:${sessionId}`);
+    memStore.delete(key);
     return null;
   }
-  
-  return JSON.parse(item.value);
-}
-
-export async function deleteSessionState(sessionId: string) {
-  store.delete(`session:${sessionId}`);
-}
-
-// User session tokens
-export async function saveUserSession(userId: string, token: string, expiresIn: number = 604800) {
-  store.set(`user:session:${token}`, {
-    value: userId,
-    expiresAt: Date.now() + expiresIn * 1000,
-  });
-}
-
-export async function getUserFromSession(token: string): Promise<string | null> {
-  const item = store.get(`user:session:${token}`);
-  if (!item) return null;
-
-  if (item.expiresAt && Date.now() > item.expiresAt) {
-    store.delete(`user:session:${token}`);
-    return null;
-  }
-
   return item.value;
 }
 
-export async function deleteUserSession(token: string) {
-  store.delete(`user:session:${token}`);
+function memDel(key: string) {
+  memStore.delete(key);
 }
 
-// Concurrent device tracking per user
+// ---------------------------------------------------------------------------
+// Redis client (production)
+// ---------------------------------------------------------------------------
+let redis: Redis | null = null;
+
+export async function initRedis() {
+  if (process.env.REDIS_URL) {
+    redis = new Redis(process.env.REDIS_URL, {
+      maxRetriesPerRequest: 3,
+      lazyConnect: true,
+    });
+    await redis.connect();
+    await redis.ping();
+    console.log('Redis connected');
+  } else {
+    console.log('Using in-memory session storage (development mode)');
+
+    // Cleanup expired items every minute
+    setInterval(() => {
+      const now = Date.now();
+      for (const [key, item] of memStore.entries()) {
+        if (item.expiresAt && now > item.expiresAt) {
+          memStore.delete(key);
+        }
+      }
+    }, 60_000);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+async function storeSet(key: string, value: string, ttlSeconds?: number) {
+  if (redis) {
+    if (ttlSeconds) {
+      await redis.setex(key, ttlSeconds, value);
+    } else {
+      await redis.set(key, value);
+    }
+  } else {
+    memSet(key, value, ttlSeconds);
+  }
+}
+
+async function storeGet(key: string): Promise<string | null> {
+  if (redis) return redis.get(key);
+  return memGet(key);
+}
+
+async function storeDel(key: string) {
+  if (redis) await redis.del(key);
+  else memDel(key);
+}
+
+async function storeExists(key: string): Promise<boolean> {
+  if (redis) return (await redis.exists(key)) === 1;
+  return memGet(key) !== null;
+}
+
+// ---------------------------------------------------------------------------
+// Session state
+// ---------------------------------------------------------------------------
+export async function saveSessionState(sessionId: string, state: any) {
+  await storeSet(`session:${sessionId}`, JSON.stringify(state), 3600);
+}
+
+export async function getSessionState(sessionId: string): Promise<any | null> {
+  const raw = await storeGet(`session:${sessionId}`);
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+export async function deleteSessionState(sessionId: string) {
+  await storeDel(`session:${sessionId}`);
+}
+
+// ---------------------------------------------------------------------------
+// User auth tokens
+// ---------------------------------------------------------------------------
+export async function saveUserSession(userId: string, token: string, expiresIn = 604800) {
+  await storeSet(`user:session:${token}`, userId, expiresIn);
+}
+
+export async function getUserFromSession(token: string): Promise<string | null> {
+  return storeGet(`user:session:${token}`);
+}
+
+export async function deleteUserSession(token: string) {
+  await storeDel(`user:session:${token}`);
+}
+
+// ---------------------------------------------------------------------------
+// Active device tracking per user (stored as JSON array of tokens)
+// ---------------------------------------------------------------------------
 function getUserSessionsKey(userId: string) {
   return `user:sessions:${userId}`;
 }
 
 export async function addUserActiveSession(userId: string, token: string) {
   const key = getUserSessionsKey(userId);
-  const existing = store.get(key);
-  const tokens: string[] = existing ? JSON.parse(existing.value) : [];
+  const raw = await storeGet(key);
+  const tokens: string[] = raw ? JSON.parse(raw) : [];
   if (!tokens.includes(token)) tokens.push(token);
-  store.set(key, { value: JSON.stringify(tokens) });
+  await storeSet(key, JSON.stringify(tokens));
 }
 
 export async function removeUserActiveSession(userId: string, token: string) {
   const key = getUserSessionsKey(userId);
-  const existing = store.get(key);
-  if (!existing) return;
-  const tokens: string[] = JSON.parse(existing.value).filter((t: string) => t !== token);
-  store.set(key, { value: JSON.stringify(tokens) });
+  const raw = await storeGet(key);
+  if (!raw) return;
+  const tokens: string[] = JSON.parse(raw).filter((t: string) => t !== token);
+  await storeSet(key, JSON.stringify(tokens));
 }
 
 export async function countUserActiveSessions(userId: string): Promise<number> {
   const key = getUserSessionsKey(userId);
-  const existing = store.get(key);
-  if (!existing) return 0;
+  const raw = await storeGet(key);
+  if (!raw) return 0;
 
-  const tokens: string[] = JSON.parse(existing.value);
-  // Filter only tokens that are still alive in the session store
-  const alive = tokens.filter((token) => {
-    const sess = store.get(`user:session:${token}`);
-    if (!sess) return false;
-    if (sess.expiresAt && Date.now() > sess.expiresAt) return false;
-    return true;
-  });
+  const tokens: string[] = JSON.parse(raw);
+  const aliveChecks = await Promise.all(
+    tokens.map((token) => storeExists(`user:session:${token}`))
+  );
+  const alive = tokens.filter((_, i) => aliveChecks[i]);
 
-  // Update stored list to remove expired tokens
-  store.set(key, { value: JSON.stringify(alive) });
+  await storeSet(key, JSON.stringify(alive));
   return alive.length;
 }
 
 export async function countUserActiveSessionsBulk(userIds: string[]): Promise<Record<string, number>> {
-  const uniqueUserIds = [...new Set(userIds.filter(Boolean))];
+  const unique = [...new Set(userIds.filter(Boolean))];
   const counts: Record<string, number> = {};
-
-  for (const userId of uniqueUserIds) {
+  await Promise.all(unique.map(async (userId) => {
     counts[userId] = await countUserActiveSessions(userId);
-  }
-
+  }));
   return counts;
 }
 
 export async function deleteAllUserSessions(userId: string) {
   const key = getUserSessionsKey(userId);
-  const existing = store.get(key);
-  if (existing) {
+  const raw = await storeGet(key);
+  if (raw) {
     try {
-      const tokens: string[] = JSON.parse(existing.value);
-      tokens.forEach((token) => {
-        store.delete(`user:session:${token}`);
-      });
+      const tokens: string[] = JSON.parse(raw);
+      await Promise.all(tokens.map((token) => storeDel(`user:session:${token}`)));
     } catch {}
   }
-  store.delete(key);
+  await storeDel(key);
 }
 
-// Cleanup expired items every minute
-setInterval(() => {
-  const now = Date.now();
-  for (const [key, item] of store.entries()) {
-    if (item.expiresAt && now > item.expiresAt) {
-      store.delete(key);
-    }
-  }
-}, 60000);
+// ---------------------------------------------------------------------------
+// Legacy — kept for compatibility
+// ---------------------------------------------------------------------------
+export function getRedis() {
+  return redis;
+}

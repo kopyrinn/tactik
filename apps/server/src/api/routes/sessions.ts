@@ -160,7 +160,7 @@ function toSessionData(session: any): Session {
     boardPieceLabels: parseBoardPieceLabels(session.board_piece_labels),
     boardState: parseBoardState(session.board_state),
     maxParticipants: session.max_participants,
-    isActive: session.is_active,
+    isActive: Boolean(session.is_active),
     isDemo: Boolean(session.is_demo),
     demoExpiresAt: session.demo_expires_at ?? null,
     demoRoomCode: session.demo_room_code ?? null,
@@ -317,7 +317,7 @@ router.post('/', authMiddleware, async (req, res) => {
       isDemoUser ? (user?.demo_expires_at || null) : null
     );
     
-    const session = db.prepare(`SELECT * FROM sessions WHERE id = ?`).get(sessionId);
+    const session = db.prepare(`SELECT * FROM sessions WHERE id = ?`).get(sessionId) as any;
 
     if (!session) {
       throw new Error('Failed to create session');
@@ -625,7 +625,8 @@ router.delete('/:id', authMiddleware, async (req, res) => {
       } as ApiResponse);
     }
 
-    // Delete session (cascade deletes participants and drawings)
+    await query('DELETE FROM drawings WHERE session_id = $1', [id]);
+    await query('DELETE FROM session_participants WHERE session_id = $1', [id]);
     await query('DELETE FROM sessions WHERE id = $1', [id]);
 
     res.json({

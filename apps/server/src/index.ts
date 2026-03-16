@@ -7,7 +7,8 @@ import dotenv from 'dotenv';
 import { setupSocketHandlers } from './socket';
 import { setupApiRoutes } from './api';
 import { initDatabase, query } from './db';
-import { deleteAllUserSessions, deleteSessionState, initRedis } from './redis';
+import { deleteAllUserSessions, initRedis } from './redis';
+import { deleteSessionWithArtifacts } from './utils/deleteSession';
 import { ensureTestProUser, ensureDemoOwnerUser } from './dev/seedTestUser';
 import { installConsoleErrorCapture, recordServerError } from './monitoring/errors';
 
@@ -111,13 +112,6 @@ async function start() {
     setInterval(async () => {
       try {
         const nowIso = new Date().toISOString();
-
-        const deleteSessionWithArtifacts = async (sessionId: string) => {
-          query('DELETE FROM drawings WHERE session_id = $1', [sessionId]);
-          query('DELETE FROM session_participants WHERE session_id = $1', [sessionId]);
-          query('DELETE FROM sessions WHERE id = $1', [sessionId]);
-          await deleteSessionState(sessionId);
-        };
 
         const expiredDemoSessions = query<{ id: string }>(
           'SELECT id FROM sessions WHERE is_demo = 1 AND demo_expires_at < $1',

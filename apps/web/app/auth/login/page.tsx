@@ -6,6 +6,9 @@ import { useAuthStore } from '@/lib/stores/authStore';
 import { authApi, demoApi } from '@/lib/api';
 import { DEMO_AUTH_STORAGE_KEY, clearDemoAuthMarker, setDemoAuthMarker } from '@/lib/constants/demo';
 
+// Замените на реальный ID видео с YouTube (часть после ?v= или youtu.be/)
+const PROMO_VIDEO_ID = 'H0X8p-c_qcc';
+
 function LoginPageContent() {
   const router = useRouter();
   const searchParams = useSearchParams();
@@ -65,7 +68,7 @@ function LoginPageContent() {
   };
 
   return (
-    <div className="min-h-screen flex items-center justify-center px-4 py-12">
+    <div className="min-h-screen flex flex-col items-center px-4 py-12">
       {isDemoLoading && (
         <div className="fixed inset-0 z-[400] bg-ucl-navy/90 backdrop-blur-sm flex items-center justify-center px-4">
           <div className="w-full max-w-md bg-white/5 border border-white/10 rounded-2xl p-7 text-center">
@@ -77,10 +80,31 @@ function LoginPageContent() {
           </div>
         </div>
       )}
-      <div className="w-full max-w-md space-y-4">
-        <div className="text-center mb-8">
-          <h1 className="text-4xl font-black uppercase text-gradient">tactik.kz</h1>
+      <div className="w-full max-w-6xl flex flex-col lg:flex-row lg:items-start gap-10">
+
+        {/* Левая колонка — описание + видео */}
+        <div className="flex-1 space-y-6 order-2 lg:order-1">
+          <div>
+            <h1 className="text-4xl font-black uppercase text-gradient mb-4">tactik.kz</h1>
+            <p className="text-white/70 text-lg leading-relaxed">
+              Инструмент для тренеров — разбираете игровые моменты прямо на видео вместе с командой.
+              Открываете YouTube, рисуете схемы, объясняете позиции. Все участники видят одно и то же в реальном времени.
+            </p>
+          </div>
+
+          <div className="relative w-full rounded-2xl overflow-hidden border border-white/10" style={{ paddingTop: '56.25%' }}>
+            <iframe
+              src={`https://www.youtube.com/embed/${PROMO_VIDEO_ID}?rel=0&modestbranding=1`}
+              title="Как работает tactik.kz"
+              allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+              allowFullScreen
+              className="absolute inset-0 w-full h-full"
+            />
+          </div>
         </div>
+
+        {/* Правая колонка — форма */}
+        <div className="w-full lg:w-[420px] lg:shrink-0 space-y-4 order-1 lg:order-2">
 
         {reason === 'inactivity' && (
           <div className="bg-yellow-500/10 border border-yellow-500/40 rounded-xl px-5 py-4 text-sm text-yellow-300">
@@ -159,7 +183,8 @@ function LoginPageContent() {
             </button>
           </form>
         </div>
-      </div>
+        </div>{/* /правая колонка */}
+      </div>{/* /две колонки */}
     </div>
   );
 }

@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { authMiddleware } from '../middleware/auth';
-import { query, queryOne } from '../../db';
+import { getDb, query, queryOne } from '../../db';
 import type { User, ApiResponse, UsageStats } from '../../types';
 
 const router = Router();
@@ -11,8 +11,8 @@ router.get('/profile', authMiddleware, async (req, res) => {
     const userId = req.userId!;
 
     const user = await queryOne<any>(
-      `SELECT id, email, name, avatar_url, plan, coach_owner_id, subscription_status, 
-              subscription_end_date, created_at, updated_at 
+      `SELECT id, email, name, avatar_url, plan, coach_owner_id, subscription_status,
+              subscription_end_date, created_at, updated_at
        FROM users WHERE id = $1`,
       [userId]
     );
@@ -56,16 +56,20 @@ router.patch('/profile', authMiddleware, async (req, res) => {
     const userId = req.userId!;
     const { name, avatarUrl } = req.body;
 
-    const user = await queryOne<any>(
-      `UPDATE users 
-       SET name = COALESCE($2, name), 
-           avatar_url = COALESCE($3, avatar_url),
-           updated_at = NOW()
-       WHERE id = $1
-       RETURNING id, email, name, avatar_url, plan, coach_owner_id, subscription_status, 
-                 subscription_end_date, created_at, updated_at`,
-      [userId, name, avatarUrl]
-    );
+    const db = getDb();
+    db.prepare(
+      `UPDATE users
+       SET name = COALESCE(?, name),
+           avatar_url = COALESCE(?, avatar_url),
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = ?`
+    ).run(name ?? null, avatarUrl ?? null, userId);
+
+    const user = db.prepare(
+      `SELECT id, email, name, avatar_url, plan, coach_owner_id, subscription_status,
+              subscription_end_date, created_at, updated_at
+       FROM users WHERE id = ?`
+    ).get(userId) as any;
 
     if (!user) {
       return res.status(404).json({
@@ -105,24 +109,20 @@ router.get('/usage', authMiddleware, async (req, res) => {
   try {
     const userId = req.userId!;
 
-    const stats = await queryOne<any>(
-      `SELECT 
-         COUNT(DISTINCT s.id) as sessions_created,
-         COUNT(DISTINCT d.id) as drawings_created,
-         MAX(ul.created_at) as last_activity
-       FROM users u
-       LEFT JOIN sessions s ON s.owner_id = u.id
-       LEFT JOIN drawings d ON d.user_id = u.id
-       LEFT JOIN usage_logs ul ON ul.user_id = u.id
-       WHERE u.id = $1`,
+    const sessionsRow = await queryOne<{ cnt: string }>(
+      'SELECT COUNT(*) as cnt FROM sessions WHERE owner_id = $1',
+      [userId]
+    );
+    const drawingsRow = await queryOne<{ cnt: string }>(
+      'SELECT COUNT(*) as cnt FROM drawings WHERE user_id = $1',
       [userId]
     );
 
     const usageStats: UsageStats = {
-      sessionsCreated: parseInt(stats?.sessions_created || '0'),
-      drawingsCreated: parseInt(stats?.drawings_created || '0'),
-      totalDuration: 0, // TODO: Calculate from usage logs
-      lastActivity: stats?.last_activity || null,
+      sessionsCreated: parseInt(sessionsRow?.cnt || '0'),
+      drawingsCreated: parseInt(drawingsRow?.cnt || '0'),
+      totalDuration: 0,
+      lastActivity: null,
     };
 
     res.json({

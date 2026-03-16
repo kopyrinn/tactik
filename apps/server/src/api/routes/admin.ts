@@ -1,14 +1,14 @@
 ﻿import { Router, Request, Response, NextFunction } from 'express';
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
-import { generateId, getDb } from '../../db';
-import { countUserActiveSessionsBulk } from '../../redis';
+import { generateId, getDb, query } from '../../db';
+import { countUserActiveSessionsBulk, deleteAllUserSessions, deleteSessionState } from '../../redis';
 import { getLiveSessionParticipantCounts, getLiveSessionSnapshots, getLiveSessionVideoSnapshots } from '../../socket';
 import { clearServerErrorLogs, getServerErrorLogs, getServerErrorSummary } from '../../monitoring/errors';
+import { JWT_SECRET } from '../../config';
 
 const router = Router();
 
-const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-this';
 const ADMIN_LOGIN = process.env.ADMIN_LOGIN || 'admin';
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin123';
 
@@ -914,12 +914,24 @@ router.patch('/users/:id', adminMiddleware, async (req, res) => {
 });
 
 // DELETE /api/admin/users/:id
-router.delete('/users/:id', adminMiddleware, (req, res) => {
+router.delete('/users/:id', adminMiddleware, async (req, res) => {
   try {
     const { id } = req.params;
     const db = getDb();
     const user = db.prepare('SELECT id FROM users WHERE id = ?').get(id);
     if (!user) return res.status(404).json({ success: false, error: 'Пользователь не найден' });
+
+    // Clean up all sessions and their related data.
+    const ownedSessions = db.prepare('SELECT id FROM sessions WHERE owner_id = ?').all(id) as { id: string }[];
+    for (const session of ownedSessions) {
+      query('DELETE FROM drawings WHERE session_id = $1', [session.id]);
+      query('DELETE FROM session_participants WHERE session_id = $1', [session.id]);
+      await deleteSessionState(session.id);
+    }
+    db.prepare('DELETE FROM sessions WHERE owner_id = ?').run(id);
+
+    // Invalidate all auth tokens for this user.
+    await deleteAllUserSessions(id);
 
     // Unlink assistants if coach account is deleted.
     db.prepare('UPDATE users SET coach_owner_id = NULL, updated_at = CURRENT_TIMESTAMP WHERE coach_owner_id = ?').run(id);
