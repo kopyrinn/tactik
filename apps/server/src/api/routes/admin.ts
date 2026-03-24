@@ -68,6 +68,17 @@ function toUtcDayKey(value: Date) {
   return value.toISOString().slice(0, 10);
 }
 
+function countBoardDrawings(rawValue: unknown) {
+  if (!rawValue || typeof rawValue !== 'string') return 0;
+
+  try {
+    const parsed = JSON.parse(rawValue) as { drawings?: unknown };
+    return Array.isArray(parsed?.drawings) ? parsed.drawings.length : 0;
+  } catch {
+    return 0;
+  }
+}
+
 // Admin auth middleware
 function adminMiddleware(req: Request, res: Response, next: NextFunction) {
   const token = req.cookies?.admin_token || req.headers.authorization?.replace('Bearer ', '');
@@ -512,9 +523,30 @@ router.get('/users/:id/sessions/stats', adminMiddleware, async (req, res) => {
        INNER JOIN sessions s ON s.id = d.session_id
        WHERE s.owner_id = ?`
     ).get(userId) as { cnt: number | string } | undefined;
+    const boardStateRows = db.prepare(
+      `SELECT board_state
+       FROM sessions
+       WHERE owner_id = ?`
+    ).all(userId) as Array<{ board_state: string | null }>;
+    const currentBoardDrawings = boardStateRows.reduce(
+      (sum, row) => sum + countBoardDrawings(row.board_state),
+      0
+    );
+    const usageTotalsRow = db.prepare(
+      `SELECT
+         COALESCE(SUM(sessions_created), 0) AS sessions_created,
+         COALESCE(SUM(drawings_created), 0) AS drawings_created,
+         COALESCE(SUM(board_drawings_created), 0) AS board_drawings_created
+       FROM user_usage_metrics_daily
+       WHERE user_id = ?`
+    ).get(userId) as {
+      sessions_created: number | string;
+      drawings_created: number | string;
+      board_drawings_created: number | string;
+    } | undefined;
 
     const recentSessions = db.prepare(
-      `SELECT id, name, youtube_url, youtube_video_id, max_participants, is_demo, is_active, demo_expires_at, created_at, updated_at
+      `SELECT id, name, youtube_url, youtube_video_id, max_participants, is_demo, is_active, demo_expires_at, created_at, updated_at, board_state
        FROM sessions
        WHERE owner_id = ?
        ORDER BY updated_at DESC
@@ -530,6 +562,7 @@ router.get('/users/:id/sessions/stats', adminMiddleware, async (req, res) => {
       demo_expires_at: string | null;
       created_at: string;
       updated_at: string;
+      board_state: string | null;
     }>;
 
     const sessionIds = recentSessions.map((session) => session.id);
@@ -561,6 +594,7 @@ router.get('/users/:id/sessions/stats', adminMiddleware, async (req, res) => {
       const secondsLeft = expiresAt
         ? Math.max(0, Math.floor((new Date(expiresAt).getTime() - now.getTime()) / 1000))
         : null;
+      const sessionBoardDrawings = countBoardDrawings(session.board_state);
 
       return {
         id: session.id,
@@ -574,7 +608,7 @@ router.get('/users/:id/sessions/stats', adminMiddleware, async (req, res) => {
         secondsLeft,
         createdAt: session.created_at,
         updatedAt: session.updated_at,
-        storedDrawings: Number(drawingsBySessionId.get(session.id) || 0),
+        storedDrawings: Number(drawingsBySessionId.get(session.id) || 0) + sessionBoardDrawings,
         live: {
           participantsTotal: Number(live?.participantCount || 0),
           participantsAuthenticated: Number(live?.authenticatedCount || 0),
@@ -588,15 +622,20 @@ router.get('/users/:id/sessions/stats', adminMiddleware, async (req, res) => {
 
     const nowUtc = new Date();
     const weekStart = new Date(Date.UTC(nowUtc.getUTCFullYear(), nowUtc.getUTCMonth(), nowUtc.getUTCDate() - 6));
-    const weekStartIso = weekStart.toISOString();
+    const weekStartKey = weekStart.toISOString().slice(0, 10);
     const weekRows = db.prepare(
-      `SELECT SUBSTR(created_at, 1, 10) as day, COUNT(*) as cnt
-       FROM sessions
-       WHERE owner_id = ? AND created_at >= ?
-       GROUP BY SUBSTR(created_at, 1, 10)
+      `SELECT day, COALESCE(SUM(sessions_created), 0) as cnt
+       FROM user_usage_metrics_daily
+       WHERE user_id = ? AND day >= ?
+       GROUP BY day
        ORDER BY day ASC`
-    ).all(userId, weekStartIso) as Array<{ day: string; cnt: number | string }>;
+    ).all(userId, weekStartKey) as Array<{ day: string; cnt: number | string }>;
     const weekMap = new Map(weekRows.map((row) => [row.day, Number(row.cnt || 0)]));
+
+    const currentStoredDrawings = Number(storedDrawingsRow?.cnt || 0) + currentBoardDrawings;
+    const historicalSessionsCreated = Number(usageTotalsRow?.sessions_created || 0);
+    const historicalDrawingsCreated =
+      Number(usageTotalsRow?.drawings_created || 0) + Number(usageTotalsRow?.board_drawings_created || 0);
 
     const last7Days = Array.from({ length: 7 }).map((_, index) => {
       const date = new Date(Date.UTC(nowUtc.getUTCFullYear(), nowUtc.getUTCMonth(), nowUtc.getUTCDate() - (6 - index)));
@@ -620,10 +659,10 @@ router.get('/users/:id/sessions/stats', adminMiddleware, async (req, res) => {
         },
         summary: {
           ownerActiveDevices,
-          totalSessions: Number(totalSessionsRow?.cnt || 0),
+          totalSessions: Math.max(Number(totalSessionsRow?.cnt || 0), historicalSessionsCreated),
           activeSessions: Number(activeSessionsRow?.cnt || 0),
           demoSessions: Number(demoSessionsRow?.cnt || 0),
-          storedDrawings: Number(storedDrawingsRow?.cnt || 0),
+          storedDrawings: Math.max(currentStoredDrawings, historicalDrawingsCreated),
           liveSessions: ownerLiveSnapshots.length,
           liveParticipantsTotal: ownerLiveSnapshots.reduce((sum, item) => sum + Number(item.participantCount || 0), 0),
           liveParticipantsAuthenticated: ownerLiveSnapshots.reduce((sum, item) => sum + Number(item.authenticatedCount || 0), 0),

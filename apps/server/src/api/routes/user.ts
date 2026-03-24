@@ -117,12 +117,30 @@ router.get('/usage', authMiddleware, async (req, res) => {
       'SELECT COUNT(*) as cnt FROM drawings WHERE user_id = $1',
       [userId]
     );
+    const usageTotalsRow = await queryOne<{
+      sessions_created: number | string;
+      drawings_created: number | string;
+      board_drawings_created: number | string;
+      last_activity_at: string | null;
+    }>(
+      `SELECT
+         COALESCE(SUM(sessions_created), 0) AS sessions_created,
+         COALESCE(SUM(drawings_created), 0) AS drawings_created,
+         COALESCE(SUM(board_drawings_created), 0) AS board_drawings_created,
+         MAX(last_activity_at) AS last_activity_at
+       FROM user_usage_metrics_daily
+       WHERE user_id = $1`,
+      [userId]
+    );
 
     const usageStats: UsageStats = {
-      sessionsCreated: parseInt(sessionsRow?.cnt || '0'),
-      drawingsCreated: parseInt(drawingsRow?.cnt || '0'),
+      sessionsCreated: Math.max(parseInt(sessionsRow?.cnt || '0'), Number(usageTotalsRow?.sessions_created || 0)),
+      drawingsCreated: Math.max(
+        parseInt(drawingsRow?.cnt || '0'),
+        Number(usageTotalsRow?.drawings_created || 0) + Number(usageTotalsRow?.board_drawings_created || 0)
+      ),
       totalDuration: 0,
-      lastActivity: null,
+      lastActivity: usageTotalsRow?.last_activity_at ? new Date(usageTotalsRow.last_activity_at) : null,
     };
 
     res.json({

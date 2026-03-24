@@ -2,18 +2,15 @@ import { Router } from 'express';
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
 import { z } from 'zod';
-import { generateId, getDb, query, queryOne } from '../../db';
+import { generateId, getDb, queryOne } from '../../db';
 import {
   saveUserSession,
-  deleteUserSession,
   getUserFromSession,
   addUserActiveSession,
-  removeUserActiveSession,
   countUserActiveSessions,
-  deleteAllUserSessions,
 } from '../../redis';
 import { JWT_SECRET } from '../../config';
-import { deleteSessionWithArtifacts } from '../../utils/deleteSession';
+import { getAuthTokenFromRequest, revokeAuthTokenSession } from '../../utils/authSession';
 import type { User, ApiResponse } from '../../types';
 
 const router = Router();
@@ -105,8 +102,11 @@ router.post('/register', async (req, res) => {
 
     if (!user) throw new Error('Failed to create user');
 
+    await revokeAuthTokenSession(getAuthTokenFromRequest(req), { cleanupDemoUser: true });
+
     const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '7d' });
     await saveUserSession(user.id, token, 604800);
+    await addUserActiveSession(user.id, token);
 
     res.cookie('auth_token', token, {
       httpOnly: true,
@@ -170,6 +170,8 @@ router.post('/login', async (req, res) => {
 
     clearLoginFailures(ip);
 
+    await revokeAuthTokenSession(getAuthTokenFromRequest(req), { cleanupDemoUser: true });
+
     const activeCount = await countUserActiveSessions(user.id);
     const limit = user.max_devices_override != null ? user.max_devices_override : getDeviceLimit(user.plan || 'free');
     if (activeCount >= limit) {
@@ -218,32 +220,7 @@ router.post('/login', async (req, res) => {
 // Logout
 router.post('/logout', async (req, res) => {
   try {
-    const token = req.cookies.auth_token || req.headers.authorization?.replace('Bearer ', '');
-    if (token) {
-      const userId = await getUserFromSession(token);
-      if (userId) {
-        const currentUser = await queryOne<{ is_demo_user: number | null }>(
-          'SELECT is_demo_user FROM users WHERE id = $1',
-          [userId]
-        );
-        const isDemoUser = currentUser?.is_demo_user === 1;
-
-        await removeUserActiveSession(userId, token);
-
-        if (isDemoUser) {
-          const ownedSessions = query<{ id: string }>(
-            'SELECT id FROM sessions WHERE owner_id = $1',
-            [userId]
-          );
-          for (const session of ownedSessions) {
-            await deleteSessionWithArtifacts(session.id);
-          }
-          await deleteAllUserSessions(userId);
-          query('DELETE FROM users WHERE id = $1', [userId]);
-        }
-      }
-      await deleteUserSession(token);
-    }
+    await revokeAuthTokenSession(getAuthTokenFromRequest(req), { cleanupDemoUser: true });
 
     res.clearCookie('auth_token');
     res.json({ success: true, message: 'Logged out successfully' } as ApiResponse);
@@ -256,7 +233,7 @@ router.post('/logout', async (req, res) => {
 // Get current user
 router.get('/me', async (req, res) => {
   try {
-    const token = req.cookies.auth_token || req.headers.authorization?.replace('Bearer ', '');
+    const token = getAuthTokenFromRequest(req);
     if (!token) {
       return res.status(401).json({ success: false, error: 'Not authenticated' } as ApiResponse);
     }

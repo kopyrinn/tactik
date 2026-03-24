@@ -2,8 +2,8 @@ module.exports = {
   apps: [
     {
       name: 'tactik-server',
-      script: 'apps/server/dist/index.js',
-      cwd: '/app',
+      script: 'dist/index.js',
+      cwd: '/app/apps/server',
       instances: 1,
       autorestart: true,
       watch: false,

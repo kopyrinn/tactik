@@ -1,9 +1,9 @@
+import 'dotenv/config';
 import express from 'express';
 import { createServer } from 'http';
 import { Server } from 'socket.io';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
-import dotenv from 'dotenv';
 import { setupSocketHandlers } from './socket';
 import { setupApiRoutes } from './api';
 import { initDatabase, query } from './db';
@@ -12,7 +12,6 @@ import { deleteSessionWithArtifacts } from './utils/deleteSession';
 import { ensureTestProUser, ensureDemoOwnerUser } from './dev/seedTestUser';
 import { installConsoleErrorCapture, recordServerError } from './monitoring/errors';
 
-dotenv.config();
 installConsoleErrorCapture();
 
 if (process.env.NODE_ENV === 'production' && !process.env.JWT_SECRET) {

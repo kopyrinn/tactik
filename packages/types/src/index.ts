@@ -138,6 +138,8 @@ export interface SocketEvents {
   'session:leave': (sessionId: string, userId: string) => void;
   'session:state': (state: SessionState) => void;
   'session:user_joined': (participant: SessionParticipant) => void;
+  'session:participant_updated': (participant: SessionParticipant) => void;
+  'session:participant_color': (data: { sessionId: string; userId: string; color: string }) => void;
   'session:user_left': (userId: string) => void;
 
   // Video controls

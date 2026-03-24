@@ -21,6 +21,48 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
+.broadcast-range {
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+}
+
+.broadcast-range:focus {
+  outline: none;
+}
+
+.broadcast-range::-webkit-slider-runnable-track {
+  height: 4px;
+  background: transparent;
+}
+
+.broadcast-range::-moz-range-track {
+  height: 4px;
+  background: transparent;
+  border: 0;
+}
+
+.broadcast-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  margin-top: -6px;
+  border-radius: 9999px;
+  border: 2px solid rgba(125, 255, 244, 0.95);
+  background: #efffff;
+  box-shadow: 0 0 0 4px rgba(99, 246, 231, 0.18), 0 0 18px rgba(110, 255, 240, 0.4);
+}
+
+.broadcast-range::-moz-range-thumb {
+  width: 16px;
+  height: 16px;
+  border: 2px solid rgba(125, 255, 244, 0.95);
+  border-radius: 9999px;
+  background: #efffff;
+  box-shadow: 0 0 0 4px rgba(99, 246, 231, 0.18), 0 0 18px rgba(110, 255, 240, 0.4);
+}
+
 @layer utilities {
   .text-gradient {
     @apply bg-clip-text text-transparent bg-gradient-hero;

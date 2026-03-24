@@ -2,13 +2,17 @@ import { Server, Socket } from 'socket.io';
 import jwt from 'jsonwebtoken';
 import type { SessionState, Drawing, VideoState, SessionParticipant, BoardState, BoardPieceLabels } from '../types';
 import { getSessionState, saveSessionState } from '../redis';
-import { incrementDemoMetric, query, queryOne } from '../db';
+import { incrementDemoMetric, incrementUserUsageMetric, query, queryOne, touchUserUsageActivity } from '../db';
 import { generateId } from '../db';
 import { JWT_SECRET } from '../config';
 
 // In-memory session state management
 const activeSessions = new Map<string, SessionState>();
-const FALLBACK_DRAWING_COLOR = '#FF0000';
+const FALLBACK_DRAWING_COLOR = '#FF4D6D';
+
+function normalizeSocketColor(value: unknown, fallback = FALLBACK_DRAWING_COLOR) {
+  return typeof value === 'string' && /^#[0-9a-f]{6}$/i.test(value) ? value.toUpperCase() : fallback;
+}
 
 type LiveParticipantSnapshot = {
   userId: string;
@@ -83,6 +87,10 @@ export function getLiveSessionSnapshots(): Record<string, LiveSessionSnapshot> {
   }
 
   return snapshots;
+}
+
+function getBoardDrawingCount(boardState: BoardState | null | undefined) {
+  return Array.isArray(boardState?.drawings) ? boardState.drawings.length : 0;
 }
 
 type DrawingRow = {
@@ -250,7 +258,8 @@ export function setupSocketHandlers(io: Server) {
       'session:join',
       async (data: { sessionId: string; userId: string; color: string; mode?: 'display' | 'participant' }) => {
       try {
-        const { sessionId, color } = data;
+        const { sessionId } = data;
+        const requestedColor = normalizeSocketColor(data.color);
         const isDisplayClient = data.mode === 'display';
 
         // Validate session exists
@@ -296,15 +305,6 @@ export function setupSocketHandlers(io: Server) {
             );
             canModerateSession = currentUser?.coach_owner_id === session.owner_id;
           }
-        }
-
-        if (!isDisplayClient && authenticatedUserId && !isDemoSession) {
-          await query(
-            `INSERT INTO session_participants (session_id, user_id, color, role)
-             VALUES ($1, $2, $3, $4)
-             ON CONFLICT (session_id, user_id) DO UPDATE SET color = $3`,
-            [sessionId, authenticatedUserId, color, 'drawer']
-          );
         }
 
         // Join socket room
@@ -377,23 +377,44 @@ export function setupSocketHandlers(io: Server) {
         const syncedVideoState = getProjectedVideoState(state.videoState);
         state.videoState = syncedVideoState;
 
-        // Send current state snapshot to new participant
-        socket.emit('session:state', {
-          ...state,
-          videoState: syncedVideoState,
-        });
-
         if (isDisplayClient) {
+          socket.emit('session:state', {
+            ...state,
+            videoState: syncedVideoState,
+          });
           console.log(`Display connected to session ${sessionId}`);
           return;
         }
 
-        // Add participant to state
+        let resolvedColor = requestedColor;
+        const existingStateParticipant = state.participants.find((participant) => participant.userId === participantUserId);
+        if (existingStateParticipant?.color) {
+          resolvedColor = normalizeSocketColor(existingStateParticipant.color, resolvedColor);
+        }
+
+        if (authenticatedUserId && !isDemoSession) {
+          const storedParticipant = await queryOne<{ color: string | null }>(
+            'SELECT color FROM session_participants WHERE session_id = $1 AND user_id = $2',
+            [sessionId, authenticatedUserId]
+          );
+          if (storedParticipant?.color) {
+            resolvedColor = normalizeSocketColor(storedParticipant.color, resolvedColor);
+          }
+
+          await query(
+            `INSERT INTO session_participants (session_id, user_id, color, role)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (session_id, user_id) DO UPDATE SET color = $3`,
+            [sessionId, authenticatedUserId, resolvedColor, 'drawer']
+          );
+          touchUserUsageActivity(session.owner_id);
+        }
+
         const participant: SessionParticipant = {
           id: socket.id,
           sessionId,
           userId: participantUserId,
-          color,
+          color: resolvedColor,
           role: session.owner_id === participantUserId ? 'owner' : 'drawer',
           joinedAt: new Date(),
         };
@@ -413,6 +434,11 @@ export function setupSocketHandlers(io: Server) {
           incrementDemoMetric('participantJoins');
         }
 
+        socket.emit('session:state', {
+          ...state,
+          videoState: syncedVideoState,
+        });
+
         // Notify others
         socket.to(sessionId).emit('session:user_joined', participant);
 
@@ -423,6 +449,43 @@ export function setupSocketHandlers(io: Server) {
       } catch (error) {
         console.error('Error joining session:', error);
         socket.emit('error', 'Failed to join session');
+      }
+    });
+
+    socket.on('session:participant_color', async (data: { sessionId: string; userId: string; color: string }) => {
+      try {
+        const access = joinedSessions.get(data.sessionId);
+        if (!access || access.mode !== 'participant') return;
+
+        const state = activeSessions.get(data.sessionId);
+        if (!state) return;
+
+        const participantIndex = state.participants.findIndex((participant) => participant.userId === data.userId);
+        if (participantIndex < 0) return;
+
+        const nextColor = normalizeSocketColor(data.color);
+        const currentParticipant = state.participants[participantIndex];
+        const updatedParticipant: SessionParticipant = {
+          ...currentParticipant,
+          color: nextColor,
+        };
+
+        state.participants[participantIndex] = updatedParticipant;
+
+        if (!access.isDemoSession && !/^guest-/i.test(updatedParticipant.userId)) {
+          await query(
+            `INSERT INTO session_participants (session_id, user_id, color, role)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (session_id, user_id) DO UPDATE SET color = $3`,
+            [data.sessionId, updatedParticipant.userId, nextColor, updatedParticipant.role]
+          );
+        }
+
+        await saveSessionState(data.sessionId, state);
+        io.to(data.sessionId).emit('session:participant_updated', updatedParticipant);
+      } catch (error) {
+        console.error('Error updating participant color:', error);
+        socket.emit('error', 'Failed to update participant color');
       }
     });
 
@@ -544,6 +607,10 @@ export function setupSocketHandlers(io: Server) {
                 JSON.stringify(drawingToSave),
               ]
             );
+            const ownerId = resolveStateOwnerId(state);
+            if (ownerId) {
+              incrementUserUsageMetric(ownerId, 'drawingsCreated');
+            }
           }
 
           // Broadcast to others
@@ -632,9 +699,22 @@ export function setupSocketHandlers(io: Server) {
         if (!state) return;
         if (!access.canModerateSession) return;
 
+        const previousBoardDrawingCount = getBoardDrawingCount(state.boardState);
+        const nextBoardDrawingCount = getBoardDrawingCount(data.boardState);
         state.boardState = data.boardState;
         socket.to(data.sessionId).emit('board:state', data.boardState);
         await saveSessionState(data.sessionId, state);
+
+        if (!access.isDemoSession) {
+          const ownerId = resolveStateOwnerId(state);
+          if (ownerId) {
+            touchUserUsageActivity(ownerId);
+            const createdBoardDrawings = Math.max(0, nextBoardDrawingCount - previousBoardDrawingCount);
+            if (createdBoardDrawings > 0) {
+              incrementUserUsageMetric(ownerId, 'boardDrawingsCreated', createdBoardDrawings);
+            }
+          }
+        }
       } catch (error) {
         console.error('Error syncing board state:', error);
       }

@@ -9,6 +9,7 @@ import {
   DemoStartQueueOverloadError,
   DemoStartRateLimitError,
 } from '../middleware/demoStartGuard';
+import { getAuthTokenFromRequest, revokeAuthTokenSession } from '../../utils/authSession';
 
 const router = Router();
 
@@ -58,6 +59,7 @@ router.post('/start', async (req, res) => {
   try {
     assertDemoStartRateLimit(req);
     releaseSlot = await acquireDemoStartSlot();
+    await revokeAuthTokenSession(getAuthTokenFromRequest(req), { cleanupDemoUser: true });
 
     let created: { login: string; email: string; userId: string; expiresAt: string } | null = null;
     const passwordHash = await getDemoPasswordHash();

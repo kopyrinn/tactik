@@ -1,7 +1,7 @@
 ﻿import { Router } from 'express';
 import { z } from 'zod';
 import QRCode from 'qrcode';
-import { generateId, getDb, incrementDemoMetric, query, queryOne } from '../../db';
+import { generateId, getDb, incrementDemoMetric, incrementUserUsageMetric, query, queryOne } from '../../db';
 import { authMiddleware } from '../middleware/auth';
 import type { Session, ApiResponse } from '../../types';
 
@@ -338,6 +338,8 @@ router.post('/', authMiddleware, async (req, res) => {
 
     if (isDemoUser) {
       incrementDemoMetric('sessionsCreated');
+    } else {
+      incrementUserUsageMetric(userId, 'sessionsCreated');
     }
 
     res.json({

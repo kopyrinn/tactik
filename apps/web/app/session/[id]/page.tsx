@@ -5,7 +5,7 @@ import Link from 'next/link';
 import { useParams, useRouter, useSearchParams } from 'next/navigation';
 import YouTube, { YouTubeEvent } from 'react-youtube';
 import { io, Socket } from 'socket.io-client';
-import { ArrowUpRight, ChevronLeft, ChevronRight, Circle, Maximize2, Minimize2, Pause, PencilLine, Play, Redo2, Slash, Trash2, Type, Undo2, Volume2, VolumeX } from 'lucide-react';
+import { ArrowUpRight, ChevronDown, ChevronLeft, ChevronRight, Circle, Maximize2, Minimize2, Pause, PencilLine, Play, Redo2, Slash, Trash2, Type, Undo2, Volume2, VolumeX } from 'lucide-react';
 import { resolveBackendBaseUrl, sessionsApi } from '@/lib/api';
 import { setDemoAuthMarker } from '@/lib/constants/demo';
 import { useAuthStore } from '@/lib/stores/authStore';
@@ -14,6 +14,20 @@ import { useInactivityLogout } from '@/lib/hooks/useInactivityLogout';
 import type { BoardPieceLabels, BoardState, Session } from '@/lib/types';
 
 type DrawTool = 'freehand' | 'arrow' | 'circle' | 'line' | 'text';
+type TimelineTone = 'cyan' | 'gold' | 'red';
+type TimelineMarkerType = 'goal' | 'dismissal' | 'substitution' | 'foul' | 'freeKick';
+
+type TimelineMarker = {
+  id: string;
+  time: number;
+  type: TimelineMarkerType;
+};
+
+type TimelineMenuState = {
+  time: number;
+  leftPercent: number;
+  markerId: string | null;
+};
 
 type FreehandData = {
   points: Array<{ x: number; y: number }>;
@@ -115,8 +129,8 @@ type DemoSessionInfo = {
   guestId: string;
 };
 
-const DEFAULT_COLOR = '#FF0000';
-const PARTICIPANT_COLORS = ['#FF0000', '#0000FF', '#00FF00', '#FFFF00', '#FF00FF', '#00FFFF'];
+const PARTICIPANT_COLORS = ['#FF4D6D', '#39F3FF', '#8CFF3F', '#FFD447', '#FF7A29', '#8C63FF', '#FF4FE1', '#3F88FF', '#00F5A0', '#FF6363'];
+const DEFAULT_COLOR = PARTICIPANT_COLORS[0];
 const PLAYBACK_RATES = [0.25, 0.5, 1, 1.5, 2];
 const TARGET_VIDEO_ASPECT_RATIO = 16 / 9;
 const LAST_SESSION_STORAGE_KEY = 'tactik:last-session-id';
@@ -153,6 +167,200 @@ const YOUTUBE_RELATED_CLOSE_ZONE = {
   maxY: 0.715,
 };
 const YOUTUBE_RELATED_PASSTHROUGH_MS = 900;
+const COMPACT_TOUCH_MAX_SHORT_SIDE_PX = 699;
+const TIMELINE_MARKER_HOLD_MS = 600;
+const TIMELINE_TRACK_INSET_PX = 8;
+const TIMELINE_MARKER_TYPES: TimelineMarkerType[] = ['goal', 'dismissal', 'substitution', 'foul', 'freeKick'];
+const getTimelineAlignedLeft = (percent: number, offsetPx = 0) => {
+  const fraction = clamp(percent, 0, 100) / 100;
+  const offset =
+    offsetPx === 0 ? '' : offsetPx > 0 ? ` + ${offsetPx}px` : ` - ${Math.abs(offsetPx)}px`;
+  return `calc(${TIMELINE_TRACK_INSET_PX}px + (100% - ${TIMELINE_TRACK_INSET_PX * 2}px) * ${fraction}${offset})`;
+};
+const getTimelineAlignedPercent = (clientX: number, rect: { left: number; width: number }) => {
+  const usableWidth = Math.max(rect.width - TIMELINE_TRACK_INSET_PX * 2, 1);
+  const alignedX = clamp(clientX - rect.left - TIMELINE_TRACK_INSET_PX, 0, usableWidth);
+  return (alignedX / usableWidth) * 100;
+};
+const DECORATIVE_TIMELINE_COLUMNS: Array<{ position: number; height: number; tone: TimelineTone }> = Array.from(
+  { length: 56 },
+  (_, index) => {
+    let tone: TimelineTone = 'cyan';
+    if (index % 14 === 0) tone = 'gold';
+    else if (index % 9 === 0) tone = 'red';
+
+    return {
+      position: (index / 55) * 100,
+      height: 2 + (index % 2),
+      tone,
+    };
+  }
+);
+const TIMELINE_TONE_STYLE: Record<TimelineTone, { active: string; inactive: string; glow: string }> = {
+  cyan: {
+    active: '#69f7e5',
+    inactive: 'rgba(105,247,229,0.32)',
+    glow: 'rgba(105,247,229,0.55)',
+  },
+  gold: {
+    active: '#d8c05e',
+    inactive: 'rgba(216,192,94,0.34)',
+    glow: 'rgba(216,192,94,0.45)',
+  },
+  red: {
+    active: '#ff6f7a',
+    inactive: 'rgba(255,111,122,0.34)',
+    glow: 'rgba(255,111,122,0.42)',
+  },
+};
+const TIMELINE_MARKER_STYLE: Record<TimelineMarkerType, { color: string; glow: string }> = {
+  goal: {
+    color: '#d8c05e',
+    glow: 'rgba(216,192,94,0.5)',
+  },
+  dismissal: {
+    color: '#ff6f7a',
+    glow: 'rgba(255,111,122,0.45)',
+  },
+  substitution: {
+    color: '#69f7e5',
+    glow: 'rgba(105,247,229,0.5)',
+  },
+  foul: {
+    color: '#f7c63d',
+    glow: 'rgba(247,198,61,0.45)',
+  },
+  freeKick: {
+    color: '#6e88ff',
+    glow: 'rgba(110,136,255,0.5)',
+  },
+};
+
+function TimelineMarkerIcon({ type, color }: { type: TimelineMarkerType; color: string }) {
+  if (type === 'goal') {
+    return (
+      <svg width="24" height="24" viewBox="0 0 20 20" fill="none" className="pointer-events-none">
+        <circle cx="10" cy="10" r="9.1" fill="#708894" />
+        <path d="M7.8 2.15h4.4l1.45 2.65-1.75 2.6H8.05L6.3 4.8 7.8 2.15Z" fill="#f1f5fa" stroke="#050607" strokeWidth="0.7" />
+        <path d="M2.55 4.75 6.3 4.8l1.75 2.6-.95 3.5-3.55 1.4L1.2 9.15 1.55 6.2Z" fill="#edf2f8" stroke="#050607" strokeWidth="0.7" />
+        <path d="M13.7 4.8 17.45 4.75l1.05 2.2-.35 3.1-3.6 1.25-1.6-3.9Z" fill="#edf2f8" stroke="#050607" strokeWidth="0.7" />
+        <path d="M8.1 7.4h3.8l1.55 3.6L10 13.55 6.55 11Z" fill="#556d7b" stroke="#050607" strokeWidth="0.7" />
+        <path d="M3.55 12.3 6.55 11 10 13.55v3.65L6.7 18.55 3.1 16.1Z" fill="#eef3f9" stroke="#050607" strokeWidth="0.7" />
+        <path d="M10 13.55 13.45 11l3.4 1.15-.2 3.7-3.4 2.65-3.25-1.3Z" fill="#eef3f9" stroke="#050607" strokeWidth="0.7" />
+        <path d="M13.25 1.95c2.7.95 4.8 3.2 5.55 5.95M17.05 15.95A8.9 8.9 0 0 1 13.2 18.5M2.2 11.3a8.85 8.85 0 0 0 2.05 5.15" stroke="#dce5ee" strokeWidth="0.85" strokeLinecap="round" opacity="0.55" />
+      </svg>
+    );
+  }
+  if (type === 'dismissal') {
+    return (
+      <svg width="17" height="22" viewBox="0 0 14 18" fill="none" className="pointer-events-none">
+        <rect x="1.1" y="1.1" width="11.8" height="15.8" rx="2.2" fill="#ff5d6c" stroke="#ffd7db" strokeWidth="1.1" />
+      </svg>
+    );
+  }
+  if (type === 'substitution') {
+    return (
+      <svg width="24" height="24" viewBox="0 0 20 20" fill="none" strokeLinecap="round" strokeLinejoin="round" className="pointer-events-none">
+        <path
+          d="M2.1 2.4h2.2l0.75 0.65h2.05l0.8 0.85-.3 2.2-1.1-.28v4.2H2.9V6.86l-1.1.3-.28-2.24.58-.54Z"
+          fill="#ff5a5f"
+          stroke="#39080e"
+          strokeWidth="0.6"
+        />
+        <path d="M3.85 4.25h1.55l-0.8 2.15" stroke="#39080e" strokeWidth="0.95" />
+        <path
+          d="M10.75 2.95h3.15v-0.7l4.1 3.55-4.1 3.5V8.6h-3.15V2.95Z"
+          fill="#ff5a5f"
+          stroke="#39080e"
+          strokeWidth="0.6"
+        />
+        <path
+          d="M9.45 17.55h2.2l0.75-.65h2.05l0.8-.85-.3-2.2-1.1.28v-4.2h-3.6v4.22l-1.1-.3-.28 2.24.58.54Z"
+          fill="#4ef07a"
+          stroke="#052611"
+          strokeWidth="0.6"
+        />
+        <rect x="11.45" y="11.2" width="0.78" height="2.95" rx="0.36" fill="#052611" />
+        <rect x="12.95" y="11.2" width="0.78" height="2.95" rx="0.36" fill="#052611" />
+        <path
+          d="M9.25 11.45H6.1v0.7L2 8.6l4.1-3.55v0.7h3.15v5.7Z"
+          fill="#4ef07a"
+          stroke="#052611"
+          strokeWidth="0.6"
+        />
+      </svg>
+    );
+  }
+  if (type === 'foul') {
+    return (
+      <svg width="24" height="24" viewBox="0 0 20 20" fill="none" className="pointer-events-none">
+        <rect
+          x="2.9"
+          y="4.2"
+          width="9.2"
+          height="13.1"
+          rx="1.7"
+          fill="#f7c63d"
+          transform="rotate(-21 2.9 4.2)"
+        />
+        <rect
+          x="4.6"
+          y="5.7"
+          width="8.6"
+          height="12.2"
+          rx="1.5"
+          fill="#e7ab0a"
+          opacity="0.55"
+          transform="rotate(-21 4.6 5.7)"
+        />
+        <rect
+          x="9.1"
+          y="2.7"
+          width="9.7"
+          height="13.8"
+          rx="1.9"
+          fill="#ff3a3a"
+          transform="rotate(16 9.1 2.7)"
+        />
+        <rect
+          x="9.6"
+          y="3.2"
+          width="8.9"
+          height="12.9"
+          rx="1.6"
+          fill="#ff4b4b"
+          opacity="0.88"
+          transform="rotate(16 9.6 3.2)"
+        />
+      </svg>
+    );
+  }
+  if (type === 'freeKick') {
+    return (
+      <svg width="24" height="24" viewBox="0 0 20 20" fill="none" className="pointer-events-none">
+        <path
+          d="M0.9 7.15c0-0.7 0.58-1.28 1.28-1.28h6.2c3.56 0 6.06 1.15 7.87 3.54l0.67 0.9c0.48 0.63 0.75 1.4 0.75 2.2 0 2-1.62 3.62-3.62 3.62h-1.65a3.2 3.2 0 0 1-3-2.1l-0.22-0.65a2.5 2.5 0 0 0-2.37-1.7H2.18c-0.7 0-1.28-0.58-1.28-1.28V7.15Z"
+          fill="#e25357"
+        />
+        <path
+          d="M1 7.15c0-0.71 0.57-1.28 1.28-1.28h6.1c3.38 0 5.77 1.03 7.56 3.18H2.28C1.57 9.05 1 8.37 1 7.15Z"
+          fill="#f7b2b4"
+          opacity="0.9"
+        />
+        <circle cx="9.55" cy="5.75" r="1.08" fill="#06080b" />
+        <circle cx="14.25" cy="11.95" r="4.25" fill="#e85f61" />
+        <circle cx="14.25" cy="11.95" r="3.35" fill="#0d1533" />
+        <circle cx="14.25" cy="11.95" r="2.68" fill="#ece6df" />
+        <path d="M14.25 9.58 15.28 10.3l-.4 1.28h-1.26l-.4-1.28 1.03-.72Z" fill="#121417" />
+        <path d="M12.48 10.02 13.18 9.66l.52 0.7-0.18 1.42-1.02 0.64-0.9-0.48 0.2-1.33 0.68-0.59Z" fill="#3f74d7" />
+        <path d="M15.32 10.35 15.96 9.68l1.1 0.27 0.34 1.13-0.55 0.9-1.32-0.25-0.22-1.38Z" fill="#3f74d7" />
+        <path d="M12.82 13.02h2.84l0.4 1.02-0.88 0.88h-1.86l-0.9-0.88 0.4-1.02Z" fill="#3f74d7" />
+        <circle cx="18.75" cy="7.15" r="0.34" fill="#9f2d27" />
+      </svg>
+    );
+  }
+  return null;
+}
 
 const VIDEO_INTERACTION_SURFACE_STYLE: React.CSSProperties = {
   userSelect: 'none',
@@ -337,6 +545,8 @@ type SessionLocaleText = {
   copyJoinLink: string;
   participants: string;
   noParticipants: string;
+  participantPencilColor: string;
+  participantPencilColorHint: string;
   displayMode: string;
   displayModeHint: string;
   openDisplay: string;
@@ -375,6 +585,17 @@ type SessionLocaleText = {
   boardNumberPrompt: string;
   teamRed: string;
   teamYellow: string;
+  timelineGoal: string;
+  timelineDismissal: string;
+  timelineSubstitution: string;
+  timelineFoul: string;
+  timelineFreeKick: string;
+  timelineMarkersButton: string;
+  timelineEditorTitle: string;
+  timelineEditorEmpty: string;
+  timelineDelete: string;
+  timelineDeleteAll: string;
+  closeModal: string;
   videoErrorInvalid: string;
   videoErrorPlayback: string;
   videoErrorNotFound: string;
@@ -418,6 +639,8 @@ const SESSION_TEXT: Record<'ru' | 'kk', SessionLocaleText> = {
     copyJoinLink: 'Копировать ссылку входа',
     participants: 'Участники',
     noParticipants: 'Пока нет участников',
+    participantPencilColor: 'Цвет карандаша',
+    participantPencilColorHint: 'Нажмите на цвет участника, чтобы выбрать яркий цвет его карандаша.',
     displayMode: 'Экран показа',
     displayModeHint: 'Открыть отдельный полноэкранный экран без панели управления.',
     openDisplay: 'Открыть экран',
@@ -456,6 +679,17 @@ const SESSION_TEXT: Record<'ru' | 'kk', SessionLocaleText> = {
     boardNumberPrompt: 'Номер фишки',
     teamRed: 'Красная команда',
     teamYellow: 'Желтая команда',
+    timelineGoal: 'Гол',
+    timelineDismissal: 'Удаление',
+    timelineSubstitution: 'Замена',
+    timelineFoul: 'Нарушение',
+    timelineFreeKick: 'Штрафной удар',
+    timelineMarkersButton: 'Метки',
+    timelineEditorTitle: 'Редактор меток',
+    timelineEditorEmpty: 'Пока нет добавленных меток.',
+    timelineDelete: 'Удалить',
+    timelineDeleteAll: 'Удалить все',
+    closeModal: 'Закрыть',
     videoErrorInvalid: 'Ошибка видео: некорректный YouTube ID или ссылка.',
     videoErrorPlayback: 'Ошибка видео на устройстве. Попробуйте обновить страницу.',
     videoErrorNotFound: 'Видео недоступно: удалено или закрыто автором.',
@@ -497,6 +731,8 @@ const SESSION_TEXT: Record<'ru' | 'kk', SessionLocaleText> = {
     copyJoinLink: 'Қосылу сілтемесін көшіру',
     participants: 'Қатысушылар',
     noParticipants: 'Қатысушылар әлі жоқ',
+    participantPencilColor: 'Қарындаш түсі',
+    participantPencilColorHint: 'Қатысушының түсін басып, оның қарындашына ашық түсті таңдаңыз.',
     displayMode: 'Көрсету режимі',
     displayModeHint: 'Басқару панелінсіз бөлек толық экранды көрсетуді ашу.',
     openDisplay: 'Экранды ашу',
@@ -535,6 +771,17 @@ const SESSION_TEXT: Record<'ru' | 'kk', SessionLocaleText> = {
     boardNumberPrompt: 'Фишка нөмірі',
     teamRed: 'Қызыл команда',
     teamYellow: 'Сары команда',
+    timelineGoal: 'Гол',
+    timelineDismissal: 'Алаңнан қуу',
+    timelineSubstitution: 'Ауыстыру',
+    timelineFoul: 'Ереже бұзу',
+    timelineFreeKick: 'Айып соққысы',
+    timelineMarkersButton: 'Белгілер',
+    timelineEditorTitle: 'Белгі редакторы',
+    timelineEditorEmpty: 'Әзірге белгі қосылмаған.',
+    timelineDelete: 'Өшіру',
+    timelineDeleteAll: 'Барлығын өшіру',
+    closeModal: 'Жабу',
     videoErrorInvalid: 'Видео қатесі: YouTube сілтемесі немесе ID қате.',
     videoErrorPlayback: 'Құрылғыда видео қатесі шықты. Бетті жаңартып көріңіз.',
     videoErrorNotFound: 'Видео қолжетімсіз: өшірілген немесе жабық.',
@@ -588,6 +835,10 @@ function shortUserId(value: string) {
   return value.length > 10 ? `${value.slice(0, 6)}...${value.slice(-4)}` : value;
 }
 
+function normalizeParticipantColor(value: unknown, fallback = DEFAULT_COLOR) {
+  return typeof value === 'string' && /^#[0-9a-f]{6}$/i.test(value) ? value.toUpperCase() : fallback;
+}
+
 function getColorForUser(userId: string, isOwner: boolean) {
   if (isOwner) return PARTICIPANT_COLORS[0];
 
@@ -604,9 +855,19 @@ function getColorForUser(userId: string, isOwner: boolean) {
 function dedupeParticipants(list: SessionParticipant[]) {
   const map = new Map<string, SessionParticipant>();
   list.forEach((participant) => {
-    map.set(participant.userId, participant);
+    map.set(participant.userId, {
+      ...participant,
+      color: normalizeParticipantColor(participant.color),
+    });
   });
   return Array.from(map.values());
+}
+
+function mergeParticipant(list: SessionParticipant[], participant: SessionParticipant) {
+  if (list.some((item) => item.userId === participant.userId)) {
+    return dedupeParticipants(list.map((item) => (item.userId === participant.userId ? participant : item)));
+  }
+  return dedupeParticipants([...list, participant]);
 }
 
 function normalizeQualityLevels(levels: unknown): string[] {
@@ -636,6 +897,21 @@ function formatSecondsToClock(totalSeconds: number) {
   const mins = Math.floor(safeSeconds / 60);
   const secs = safeSeconds % 60;
   return `${mins}:${String(secs).padStart(2, '0')}`;
+}
+
+function normalizeTimelineMarkers(value: unknown): TimelineMarker[] {
+  if (!Array.isArray(value)) return [];
+
+  return value
+    .filter((item): item is Partial<TimelineMarker> => Boolean(item) && typeof item === 'object')
+    .map((item) => ({
+      id: typeof item.id === 'string' ? item.id : createId(),
+      time: Number.isFinite(item.time) ? Math.max(0, Number(item.time)) : 0,
+      type: item.type === 'goal' || item.type === 'dismissal' || item.type === 'substitution' || item.type === 'foul'
+        ? item.type
+        : 'foul',
+    }))
+    .sort((left, right) => left.time - right.time);
 }
 
 function getDemoSecondsLeft(expiresAt: string) {
@@ -821,6 +1097,7 @@ export default function SessionPage() {
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [isPseudoFullscreen, setIsPseudoFullscreen] = useState(false);
   const [isTouchLayout, setIsTouchLayout] = useState(false);
+  const [isCompactTouchLayout, setIsCompactTouchLayout] = useState(false);
   const [isTouchLandscape, setIsTouchLandscape] = useState(false);
   const [isImmersiveControlsVisible, setIsImmersiveControlsVisible] = useState(true);
   const [isTopTouchBarCollapsed, setIsTopTouchBarCollapsed] = useState(false);
@@ -836,6 +1113,12 @@ export default function SessionPage() {
   const [boardDraft, setBoardDraft] = useState<BoardPath | null>(null);
   const [boardStateDirty, setBoardStateDirty] = useState(false);
   const [boardLabelsDirty, setBoardLabelsDirty] = useState(false);
+  const [timelineMarkers, setTimelineMarkers] = useState<TimelineMarker[]>([]);
+  const [timelineMenuState, setTimelineMenuState] = useState<TimelineMenuState | null>(null);
+  const [isTimelineEditorOpen, setIsTimelineEditorOpen] = useState(false);
+  const [isTimelineMarkersReady, setIsTimelineMarkersReady] = useState(false);
+  const [isQualityMenuOpen, setIsQualityMenuOpen] = useState(false);
+  const [activeParticipantColorUserId, setActiveParticipantColorUserId] = useState<string | null>(null);
   const [boardScrollIndicator, setBoardScrollIndicator] = useState({
     visible: false,
     top: 0,
@@ -867,6 +1150,7 @@ export default function SessionPage() {
   const boardCanvasDprRef = useRef(1);
   const canvasDprRef = useRef(1);
   const youtubeClosePassThroughTimerRef = useRef<number | null>(null);
+  const youtubeReadyTimeoutRef = useRef<number | null>(null);
   const circleStartRef = useRef<{ x: number; y: number } | null>(null);
   const lastDrawEmitAtRef = useRef(0);
   const suppressVideoEmitRef = useRef(false);
@@ -876,6 +1160,9 @@ export default function SessionPage() {
   const boardSyncTimerRef = useRef<number | null>(null);
   const lastBoardEmitAtRef = useRef(0);
   const boardVisibilityLockRef = useRef<{ value: boolean; ts: number } | null>(null);
+  const timelineHoldTimerRef = useRef<number | null>(null);
+  const timelineHoldPointerRef = useRef<{ pointerId: number; startX: number; startY: number } | null>(null);
+  const suppressTimelineMarkerClickRef = useRef(false);
   const isImmersiveMode = isFullscreen || isPseudoFullscreen;
   const showImmersiveControls = !isTouchLayout || isImmersiveControlsVisible;
   const showTopActionBar = !isTouchLayout || !isTopTouchBarCollapsed;
@@ -889,6 +1176,13 @@ export default function SessionPage() {
     [sessionDemoSecondsLeft]
   );
   const showSessionDemoTimer = sessionDemoSecondsLeft > 0 && Boolean(demoExpiresAtEffective);
+  const youtubeThumbnailUrl = useMemo(
+    () => (session?.youtubeVideoId ? `https://i.ytimg.com/vi/${session.youtubeVideoId}/hqdefault.jpg` : null),
+    [session?.youtubeVideoId]
+  );
+  const showYoutubeThumbnailOverlay = Boolean(
+    youtubeThumbnailUrl && !videoError && !isPlaying && currentTime <= 0.5
+  );
 
   const toolLabels: Record<DrawTool, string> = useMemo(
     () => ({
@@ -920,14 +1214,33 @@ export default function SessionPage() {
   const isShapeToolActive = useMemo(() => MOBILE_SHAPE_TOOL_SET.has(activeTool), [activeTool]);
   const qualityOptions = useMemo(
     () => [
-      { value: 'auto', label: text.qualityAuto },
       { value: 'max', label: text.qualityMax },
+      { value: 'auto', label: text.qualityAuto },
       ...availableQualities.map((level) => ({
         value: level,
         label: QUALITY_LABELS[level] || level,
       })),
     ],
     [availableQualities, text.qualityAuto, text.qualityMax]
+  );
+  const safeDuration = Number.isFinite(duration) ? Math.max(duration, 0) : 0;
+  const clampedCurrentTime = safeDuration > 0 ? clamp(currentTime, 0, safeDuration) : 0;
+  const playbackProgress = safeDuration > 0 ? (clampedCurrentTime / safeDuration) * 100 : 0;
+  const currentTimeLabel = formatSecondsToClock(clampedCurrentTime);
+  const durationLabel = formatSecondsToClock(safeDuration);
+  const timelineStorageKey = useMemo(
+    () => (sessionId ? `tactik:timeline-markers:${sessionId}` : null),
+    [sessionId]
+  );
+  const timelineMarkerTypeLabels = useMemo(
+    () => ({
+      goal: text.timelineGoal,
+      dismissal: text.timelineDismissal,
+      substitution: text.timelineSubstitution,
+      foul: text.timelineFoul,
+      freeKick: text.timelineFreeKick,
+    }),
+    [text.timelineDismissal, text.timelineFoul, text.timelineFreeKick, text.timelineGoal, text.timelineSubstitution]
   );
   const youtubePlayerOpts = useMemo(() => {
     const playerVars: Record<string, string | number> = {
@@ -952,6 +1265,28 @@ export default function SessionPage() {
       playerVars,
     };
   }, [youtubeHost]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || !timelineStorageKey) {
+      setTimelineMarkers([]);
+      setIsTimelineMarkersReady(false);
+      return;
+    }
+
+    setIsTimelineMarkersReady(false);
+    try {
+      const raw = window.localStorage.getItem(timelineStorageKey);
+      setTimelineMarkers(raw ? normalizeTimelineMarkers(JSON.parse(raw)) : []);
+    } catch {
+      setTimelineMarkers([]);
+    }
+    setIsTimelineMarkersReady(true);
+  }, [timelineStorageKey]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || !timelineStorageKey || !isTimelineMarkersReady) return;
+    window.localStorage.setItem(timelineStorageKey, JSON.stringify(timelineMarkers));
+  }, [isTimelineMarkersReady, timelineMarkers, timelineStorageKey]);
 
   useEffect(() => {
     const expiresAtFromSession = session?.isDemo ? session.demoExpiresAt ?? null : null;
@@ -987,11 +1322,18 @@ export default function SessionPage() {
   useEffect(() => {
     setVideoError(null);
     setIsPlayerReady(false);
+    setIsPlaying(false);
+    setDuration(0);
+    playerRef.current = null;
     setIsYoutubeClosePassThrough(false);
     setIsYoutubeClosePassThroughArmed(true);
     if (youtubeClosePassThroughTimerRef.current) {
       window.clearTimeout(youtubeClosePassThroughTimerRef.current);
       youtubeClosePassThroughTimerRef.current = null;
+    }
+    if (youtubeReadyTimeoutRef.current) {
+      window.clearTimeout(youtubeReadyTimeoutRef.current);
+      youtubeReadyTimeoutRef.current = null;
     }
     if (canvasRef.current) {
       canvasRef.current.style.pointerEvents = '';
@@ -1005,19 +1347,56 @@ export default function SessionPage() {
       if (youtubeClosePassThroughTimerRef.current) {
         window.clearTimeout(youtubeClosePassThroughTimerRef.current);
       }
+      if (youtubeReadyTimeoutRef.current) {
+        window.clearTimeout(youtubeReadyTimeoutRef.current);
+      }
     };
   }, []);
+
+  useEffect(() => {
+    if (!session?.youtubeVideoId || isPlayerReady) {
+      if (youtubeReadyTimeoutRef.current) {
+        window.clearTimeout(youtubeReadyTimeoutRef.current);
+        youtubeReadyTimeoutRef.current = null;
+      }
+      return;
+    }
+
+    if (youtubeReadyTimeoutRef.current) {
+      window.clearTimeout(youtubeReadyTimeoutRef.current);
+    }
+
+    youtubeReadyTimeoutRef.current = window.setTimeout(() => {
+      if (!youtubeHostFallbackTriedRef.current && youtubeHost !== 'https://www.youtube.com') {
+        youtubeHostFallbackTriedRef.current = true;
+        setIsPlayerReady(false);
+        setVideoError(null);
+        playerRef.current = null;
+        setYoutubeHost('https://www.youtube.com');
+        return;
+      }
+
+      setVideoError(text.videoErrorGeneric);
+    }, 8000);
+
+    return () => {
+      if (youtubeReadyTimeoutRef.current) {
+        window.clearTimeout(youtubeReadyTimeoutRef.current);
+        youtubeReadyTimeoutRef.current = null;
+      }
+    };
+  }, [isPlayerReady, session?.youtubeVideoId, text.videoErrorGeneric, youtubeHost]);
 
   const handleToolSelect = useCallback(
     (tool: DrawTool) => {
       setActiveTool(tool);
 
-      if (isTouchLayout) {
+      if (isCompactTouchLayout) {
         if (tool !== 'freehand') setIsMobileThicknessOpen(false);
         if (!MOBILE_SHAPE_TOOL_SET.has(tool)) setIsMobileShapeMenuOpen(false);
       }
     },
-    [isTouchLayout]
+    [isCompactTouchLayout]
   );
 
   const handleMobilePencilSelect = useCallback(() => {
@@ -1041,11 +1420,11 @@ export default function SessionPage() {
   const handleThicknessSelect = useCallback(
     (value: number) => {
       setLineThickness(value);
-      if (isTouchLayout) {
+      if (isCompactTouchLayout) {
         setIsMobileThicknessOpen(false);
       }
     },
-    [isTouchLayout]
+    [isCompactTouchLayout]
   );
 
   const getRoleLabel = useCallback(
@@ -1055,6 +1434,35 @@ export default function SessionPage() {
       return text.roleViewer;
     },
     [text.roleDrawer, text.roleOwner, text.roleViewer]
+  );
+
+  const handleParticipantColorChange = useCallback(
+    (participantUserId: string, nextColor: string) => {
+      if (!sessionId) return;
+
+      const normalizedColor = normalizeParticipantColor(nextColor, '');
+      if (!normalizedColor) return;
+
+      setParticipants((prev) =>
+        dedupeParticipants(
+          prev.map((participant) =>
+            participant.userId === participantUserId
+              ? {
+                  ...participant,
+                  color: normalizedColor,
+                }
+              : participant
+          )
+        )
+      );
+      setActiveParticipantColorUserId(null);
+      socketRef.current?.emit('session:participant_color', {
+        sessionId,
+        userId: participantUserId,
+        color: normalizedColor,
+      });
+    },
+    [sessionId]
   );
 
   const canManageBoardLabels = useMemo(() => {
@@ -1077,6 +1485,10 @@ export default function SessionPage() {
   }, [boardPieces]);
 
   const boardSelectedSet = useMemo(() => new Set(boardSelectedPieceIds), [boardSelectedPieceIds]);
+  const myParticipant = useMemo(
+    () => participants.find((participant) => participant.userId === userIdForSocket) || null,
+    [participants, userIdForSocket]
+  );
 
   const updateBoardScrollIndicator = useCallback(() => {
     const container = boardOverlayScrollRef.current;
@@ -1252,9 +1664,12 @@ export default function SessionPage() {
   }, []);
 
   const myColor = useMemo(() => {
+    if (myParticipant?.color) {
+      return normalizeParticipantColor(myParticipant.color);
+    }
     if (!sessionId) return DEFAULT_COLOR;
     return getColorForUser(userIdForSocket, session?.ownerId === user?.id);
-  }, [session?.ownerId, sessionId, user?.id, userIdForSocket]);
+  }, [myParticipant?.color, session?.ownerId, sessionId, user?.id, userIdForSocket]);
 
   const joinUrl = useMemo(() => {
     if (typeof window === 'undefined' || !session) return '';
@@ -1870,6 +2285,230 @@ export default function SessionPage() {
     [duration, emitVideo]
   );
 
+  const cancelTimelineHold = useCallback(() => {
+    if (timelineHoldTimerRef.current) {
+      window.clearTimeout(timelineHoldTimerRef.current);
+      timelineHoldTimerRef.current = null;
+    }
+    timelineHoldPointerRef.current = null;
+  }, []);
+
+  const openTimelineMenu = useCallback((time: number, leftPercent: number, markerId: string | null) => {
+    setTimelineMenuState({
+      time,
+      leftPercent: clamp(leftPercent, 10, 90),
+      markerId,
+    });
+  }, []);
+
+  const beginTimelineHold = useCallback(
+    (
+      event: React.PointerEvent<HTMLElement>,
+      options: { time: number; leftPercent: number; markerId: string | null; suppressClick?: boolean }
+    ) => {
+      if (safeDuration <= 0) return;
+
+      cancelTimelineHold();
+      timelineHoldPointerRef.current = {
+        pointerId: event.pointerId,
+        startX: event.clientX,
+        startY: event.clientY,
+      };
+
+      timelineHoldTimerRef.current = window.setTimeout(() => {
+        if (options.suppressClick) {
+          suppressTimelineMarkerClickRef.current = true;
+        }
+        openTimelineMenu(options.time, options.leftPercent, options.markerId);
+        timelineHoldTimerRef.current = null;
+      }, TIMELINE_MARKER_HOLD_MS);
+    },
+    [cancelTimelineHold, openTimelineMenu, safeDuration]
+  );
+
+  const handleTimelineRailPointerDown = useCallback(
+    (event: React.PointerEvent<HTMLDivElement>) => {
+      if (safeDuration <= 0) return;
+      if (event.pointerType === 'mouse' && event.button !== 0) return;
+
+      const rect = event.currentTarget.getBoundingClientRect();
+      if (rect.width <= 0) return;
+
+      const leftPercent = getTimelineAlignedPercent(event.clientX, rect);
+      const markerTime = (leftPercent / 100) * safeDuration;
+      beginTimelineHold(event, {
+        time: markerTime,
+        leftPercent,
+        markerId: null,
+      });
+    },
+    [beginTimelineHold, safeDuration]
+  );
+
+  const handleTimelineMarkerPointerDown = useCallback(
+    (event: React.PointerEvent<HTMLButtonElement>, marker: TimelineMarker) => {
+      event.stopPropagation();
+      if (safeDuration <= 0) return;
+      if (event.pointerType === 'mouse' && event.button !== 0) return;
+
+      beginTimelineHold(event, {
+        time: marker.time,
+        leftPercent: safeDuration > 0 ? (marker.time / safeDuration) * 100 : 0,
+        markerId: marker.id,
+        suppressClick: true,
+      });
+    },
+    [beginTimelineHold, safeDuration]
+  );
+
+  const handleTimelinePointerMove = useCallback(
+    (event: React.PointerEvent<HTMLElement>) => {
+      const active = timelineHoldPointerRef.current;
+      if (!active || active.pointerId !== event.pointerId) return;
+
+      if (Math.hypot(event.clientX - active.startX, event.clientY - active.startY) > 8) {
+        cancelTimelineHold();
+      }
+    },
+    [cancelTimelineHold]
+  );
+
+  const handleTimelinePointerUp = useCallback(
+    (event: React.PointerEvent<HTMLElement>) => {
+      const active = timelineHoldPointerRef.current;
+      if (!active || active.pointerId !== event.pointerId) return;
+      cancelTimelineHold();
+    },
+    [cancelTimelineHold]
+  );
+
+  const handleTimelineMarkerClick = useCallback(
+    (marker: TimelineMarker) => {
+      if (suppressTimelineMarkerClickRef.current) {
+        suppressTimelineMarkerClickRef.current = false;
+        return;
+      }
+      handleSeek(marker.time, true);
+      setTimelineMenuState(null);
+    },
+    [handleSeek]
+  );
+
+  const handleTimelineMenuSelect = useCallback(
+    (type: TimelineMarkerType) => {
+      if (!timelineMenuState) return;
+
+      setTimelineMarkers((prev) => {
+        const next = timelineMenuState.markerId
+          ? prev.map((marker) =>
+              marker.id === timelineMenuState.markerId
+                ? {
+                    ...marker,
+                    type,
+                    time: timelineMenuState.time,
+                  }
+                : marker
+            )
+          : [
+              ...prev,
+              {
+                id: createId(),
+                time: timelineMenuState.time,
+                type,
+              },
+            ];
+
+        return [...next].sort((left, right) => left.time - right.time);
+      });
+
+      setTimelineMenuState(null);
+    },
+    [timelineMenuState]
+  );
+
+  const handleTimelineMarkerDelete = useCallback((markerId: string) => {
+    setTimelineMarkers((prev) => prev.filter((marker) => marker.id !== markerId));
+    setTimelineMenuState((prev) => (prev?.markerId === markerId ? null : prev));
+  }, []);
+
+  const handleTimelineDeleteAll = useCallback(() => {
+    setTimelineMarkers([]);
+    setTimelineMenuState(null);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      cancelTimelineHold();
+    };
+  }, [cancelTimelineHold]);
+
+  useEffect(() => {
+    if (!timelineMenuState) return;
+
+    const handlePointerDown = (event: PointerEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (target?.closest('[data-timeline-menu="1"]')) return;
+      setTimelineMenuState(null);
+    };
+
+    document.addEventListener('pointerdown', handlePointerDown);
+    return () => {
+      document.removeEventListener('pointerdown', handlePointerDown);
+    };
+  }, [timelineMenuState]);
+
+  useEffect(() => {
+    if (!activeParticipantColorUserId) return;
+
+    const handlePointerDown = (event: PointerEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (target?.closest('[data-participant-color-picker="1"]')) return;
+      setActiveParticipantColorUserId(null);
+    };
+
+    document.addEventListener('pointerdown', handlePointerDown);
+    return () => {
+      document.removeEventListener('pointerdown', handlePointerDown);
+    };
+  }, [activeParticipantColorUserId]);
+
+  useEffect(() => {
+    if (!isQualityMenuOpen) return;
+
+    const handlePointerDown = (event: PointerEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (target?.closest('[data-quality-menu="1"]')) return;
+      setIsQualityMenuOpen(false);
+    };
+
+    document.addEventListener('pointerdown', handlePointerDown);
+    return () => {
+      document.removeEventListener('pointerdown', handlePointerDown);
+    };
+  }, [isQualityMenuOpen]);
+
+  useEffect(() => {
+    if (!activeParticipantColorUserId) return;
+    if (!participants.some((participant) => participant.userId === activeParticipantColorUserId)) {
+      setActiveParticipantColorUserId(null);
+    }
+  }, [activeParticipantColorUserId, participants]);
+
+  useEffect(() => {
+    if (!isTimelineEditorOpen) return;
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setIsTimelineEditorOpen(false);
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [isTimelineEditorOpen]);
+
   const handlePlaybackRate = useCallback((rate: number) => {
     const player = playerRef.current;
     if (!player) return;
@@ -1930,6 +2569,10 @@ export default function SessionPage() {
 
   const handlePlayerReady = useCallback(
     (event: YouTubeEvent) => {
+      if (youtubeReadyTimeoutRef.current) {
+        window.clearTimeout(youtubeReadyTimeoutRef.current);
+        youtubeReadyTimeoutRef.current = null;
+      }
       playerRef.current = event.target;
       setIsPlayerReady(true);
       setVideoError(null);
@@ -1971,6 +2614,9 @@ export default function SessionPage() {
 
     if (!youtubeHostFallbackTriedRef.current && youtubeHost !== 'https://www.youtube.com' && (code === 5 || code === 153)) {
       youtubeHostFallbackTriedRef.current = true;
+      setIsPlayerReady(false);
+      setVideoError(null);
+      playerRef.current = null;
       setYoutubeHost('https://www.youtube.com');
       return;
     }
@@ -2027,7 +2673,30 @@ export default function SessionPage() {
     event.stopPropagation();
   }, [canDraw]);
 
-  const handleCanvasPointerDown = (event: React.PointerEvent<HTMLCanvasElement>) => {
+  const finalizeCurrentDraft = useCallback(() => {
+    const draft = currentDraftRef.current;
+    if (!draft || !sessionId) return;
+
+    const finalDrawing: SessionDrawing = {
+      ...draft,
+      isDraft: false,
+      createdAt: new Date().toISOString(),
+    };
+
+    lastDrawEmitAtRef.current = 0;
+    currentDraftRef.current = null;
+    circleStartRef.current = null;
+    setDrawings((prev) => [...prev, finalDrawing]);
+    setRedoStack([]);
+    setCurrentDraft(null);
+
+    socketRef.current?.emit('draw:end', {
+      sessionId,
+      drawing: finalDrawing,
+    });
+  }, [sessionId]);
+
+  const handleCanvasPointerDown = useCallback((event: React.PointerEvent<HTMLCanvasElement>) => {
     if (!canDraw || !sessionId) return;
 
     if (isYoutubeClosePassThroughArmed && isInYoutubeRelatedCloseZone(event, wrapperRef.current)) {
@@ -2085,10 +2754,12 @@ export default function SessionPage() {
     }
 
     lastDrawEmitAtRef.current = 0;
-    try {
-      event.currentTarget.setPointerCapture(event.pointerId);
-    } catch {
-      // Ignore if browser does not support pointer capture on this target.
+    if (!isTouchLayout) {
+      try {
+        event.currentTarget.setPointerCapture(event.pointerId);
+      } catch {
+        // Ignore if browser does not support pointer capture on this target.
+      }
     }
 
     const base: SessionDrawing = {
@@ -2119,7 +2790,19 @@ export default function SessionPage() {
     currentDraftRef.current = base;
     setCurrentDraft(base);
     socketRef.current?.emit('draw:start', { sessionId, drawing: base });
-  };
+  }, [
+    activeTool,
+    canDraw,
+    currentTime,
+    getPointerPoint,
+    isTouchLayout,
+    isYoutubeClosePassThroughArmed,
+    lineThickness,
+    myColor,
+    sessionId,
+    text.enterLabel,
+    userIdForSocket,
+  ]);
 
   const handleCanvasPointerMove = (event: React.PointerEvent<HTMLCanvasElement>) => {
     if (!canDraw) return;
@@ -2173,36 +2856,20 @@ export default function SessionPage() {
     }
   };
 
-  const handleCanvasPointerUp = (event?: React.PointerEvent<HTMLCanvasElement>) => {
+  const handleCanvasPointerUp = useCallback((event?: React.PointerEvent<HTMLCanvasElement>) => {
     const draft = currentDraftRef.current;
     if (!draft || !sessionId) return;
     event?.preventDefault();
     event?.stopPropagation();
-    if (event) {
+    if (event && !isTouchLayout) {
       try {
         event.currentTarget.releasePointerCapture(event.pointerId);
       } catch {
         // Ignore if capture was not active.
       }
     }
-
-    const finalDrawing: SessionDrawing = {
-      ...draft,
-      isDraft: false,
-      createdAt: new Date().toISOString(),
-    };
-
-    lastDrawEmitAtRef.current = 0;
-    currentDraftRef.current = null;
-    setDrawings((prev) => [...prev, finalDrawing]);
-    setRedoStack([]);
-    setCurrentDraft(null);
-
-    socketRef.current?.emit('draw:end', {
-      sessionId,
-      drawing: finalDrawing,
-    });
-  };
+    finalizeCurrentDraft();
+  }, [finalizeCurrentDraft, isTouchLayout, sessionId]);
 
   const handleUndo = useCallback(() => {
     if (!sessionId) return;
@@ -2428,6 +3095,22 @@ export default function SessionPage() {
   }, [boardMode, finalizeBoardDraft, isBoardOpen]);
 
   useEffect(() => {
+    if (!currentDraft || !canDraw) return;
+
+    const onPointerEnd = () => {
+      finalizeCurrentDraft();
+    };
+
+    window.addEventListener('pointerup', onPointerEnd);
+    window.addEventListener('pointercancel', onPointerEnd);
+
+    return () => {
+      window.removeEventListener('pointerup', onPointerEnd);
+      window.removeEventListener('pointercancel', onPointerEnd);
+    };
+  }, [canDraw, currentDraft, finalizeCurrentDraft]);
+
+  useEffect(() => {
     const onResize = () => {
       resizeCanvas();
       redrawCanvas();
@@ -2542,7 +3225,9 @@ export default function SessionPage() {
     const landscapeQuery = window.matchMedia('(orientation: landscape)');
     const updateLayout = () => {
       const isTouch = mediaQuery.matches;
+      const shortestSide = Math.min(window.innerWidth, window.innerHeight);
       setIsTouchLayout(isTouch);
+      setIsCompactTouchLayout(isTouch && shortestSide <= COMPACT_TOUCH_MAX_SHORT_SIDE_PX);
       setIsTouchLandscape(isTouch && landscapeQuery.matches);
     };
 
@@ -2567,28 +3252,37 @@ export default function SessionPage() {
   }, []);
 
   useEffect(() => {
-    if (!isTouchLayout) {
+    if (!isCompactTouchLayout) {
       setIsMobileThicknessOpen(false);
       setIsMobileShapeMenuOpen(false);
+    }
+    if (!isTouchLayout) {
       setIsTopTouchBarCollapsed(false);
     }
-  }, [isTouchLayout]);
+  }, [isCompactTouchLayout, isTouchLayout]);
 
   useEffect(() => {
-    if (!isTouchLayout) return;
+    if (!isCompactTouchLayout) return;
     if (activeTool !== 'freehand') {
       setIsMobileThicknessOpen(false);
     }
     if (!MOBILE_SHAPE_TOOL_SET.has(activeTool)) {
       setIsMobileShapeMenuOpen(false);
     }
-  }, [activeTool, isTouchLayout]);
+  }, [activeTool, isCompactTouchLayout]);
 
   useEffect(() => {
     if (isImmersiveMode) {
       setIsImmersiveControlsVisible(true);
     }
   }, [isImmersiveMode]);
+
+  useEffect(() => {
+    if (canDraw) return;
+    currentDraftRef.current = null;
+    circleStartRef.current = null;
+    setCurrentDraft(null);
+  }, [canDraw]);
 
   useEffect(() => {
     if (!sessionId) return;
@@ -2628,12 +3322,11 @@ export default function SessionPage() {
     });
 
     socket.on('session:user_joined', (participant: SessionParticipant) => {
-      setParticipants((prev) => {
-        if (prev.some((p) => p.userId === participant.userId)) {
-          return dedupeParticipants(prev.map((p) => (p.userId === participant.userId ? participant : p)));
-        }
-        return dedupeParticipants([...prev, participant]);
-      });
+      setParticipants((prev) => mergeParticipant(prev, participant));
+    });
+
+    socket.on('session:participant_updated', (participant: SessionParticipant) => {
+      setParticipants((prev) => mergeParticipant(prev, participant));
     });
 
     socket.on('session:user_left', (leftUserId: string) => {
@@ -2704,7 +3397,7 @@ export default function SessionPage() {
       socket.disconnect();
       socketRef.current = null;
     };
-  }, [applyBoardVisibility, applyIncomingBoardState, applyVideoSync, isDisplayMode, isDemoMode, demoGuestId, myColor, sessionId, socketUrl, userIdForSocket]);
+  }, [applyBoardVisibility, applyIncomingBoardState, applyVideoSync, isDisplayMode, isDemoMode, demoGuestId, sessionId, socketUrl, userIdForSocket]);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -2739,6 +3432,80 @@ export default function SessionPage() {
 
     return () => window.clearInterval(timer);
   }, [applyQualityPreference, qualityPreference, syncQualityLevels]);
+
+  useEffect(() => {
+    setQualityPreference('max');
+    setIsQualityMenuOpen(false);
+
+    const player = playerRef.current;
+    if (player) {
+      applyQualityPreference('max', player);
+    }
+  }, [applyQualityPreference, session?.youtubeVideoId, sessionId]);
+
+  const renderPlaybackRateControl = (keyPrefix: string) => (
+    <div className="flex items-center gap-2 rounded-full border border-[#2c5a61] bg-[#08141b] px-2.5 py-0.5">
+      <span className="text-[11px] font-black uppercase tracking-[0.18em] text-white/55">
+        {text.speed}
+      </span>
+      <div className="relative">
+        <select
+          value={String(playbackRate)}
+          onChange={(e) => handlePlaybackRate(Number(e.target.value))}
+          className="min-w-[72px] appearance-none bg-transparent py-1 pl-0 pr-5 text-sm font-black text-[#88fdef] outline-none"
+          aria-label={text.speed}
+        >
+          {PLAYBACK_RATES.map((rate) => (
+            <option key={`${keyPrefix}-${rate}`} value={String(rate)}>
+              {rate}x
+            </option>
+          ))}
+        </select>
+        <ChevronDown className="pointer-events-none absolute right-0 top-1/2 h-4 w-4 -translate-y-1/2 text-white/45" />
+      </div>
+    </div>
+  );
+
+  const renderQualityControl = (keyPrefix: string) => (
+    <div className="relative" data-quality-menu="1">
+      {isQualityMenuOpen && (
+        <div className="absolute bottom-full left-0 z-30 mb-2 min-w-[170px] rounded-[18px] border border-[#2c5d63] bg-[linear-gradient(180deg,rgba(13,24,33,0.98),rgba(7,18,24,0.98))] p-2 shadow-[0_22px_50px_rgba(0,0,0,0.46)] backdrop-blur-xl">
+          <div className="flex flex-col gap-1">
+            {qualityOptions.map((option) => {
+              const isActive = qualityPreference === option.value;
+              return (
+                <button
+                  key={`${keyPrefix}-${option.value}`}
+                  type="button"
+                  onClick={() => {
+                    handleQualityChange(option.value);
+                    setIsQualityMenuOpen(false);
+                  }}
+                  className={`inline-flex h-9 items-center justify-between rounded-[12px] px-3 text-left text-[12px] font-black uppercase tracking-[0.12em] transition-colors ${
+                    isActive
+                      ? 'bg-[#63f6e7]/18 text-[#8efdf1]'
+                      : 'bg-transparent text-white/78 hover:bg-white/[0.06] hover:text-white'
+                  }`}
+                >
+                  <span>{option.label}</span>
+                  {isActive && <span className="text-[#63f6e7]">•</span>}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      <button
+        type="button"
+        onClick={() => setIsQualityMenuOpen((prev) => !prev)}
+        className="inline-flex h-9 items-center gap-2 rounded-full border border-[#2c5d63] bg-[#0d1821] px-3 text-[11px] font-black uppercase tracking-[0.14em] text-[#8efdf1] transition-colors hover:bg-[#12212d]"
+      >
+        {text.quality}
+        <ChevronDown className={`h-4 w-4 transition-transform ${isQualityMenuOpen ? 'rotate-180' : ''}`} />
+      </button>
+    </div>
+  );
 
   if (isLoading) {
     return (
@@ -2797,6 +3564,8 @@ export default function SessionPage() {
   }
 
   const participantsCountLabel = `${participants.length}/${session.maxParticipants}`;
+  const isTabletTouchLayout = isTouchLayout && !isCompactTouchLayout;
+  const isTabletInlineLayout = isTabletTouchLayout && !isImmersiveMode;
   const boardControlButtonClass = isTouchLayout
     ? 'px-3 py-1.5 rounded-lg text-xs font-semibold'
     : 'px-4 py-2 rounded-lg text-sm font-semibold';
@@ -2812,6 +3581,118 @@ export default function SessionPage() {
         WebkitUserSelect: 'none',
         WebkitTouchCallout: 'none',
       };
+  const leftToolbarWrapperClass = isTabletTouchLayout
+    ? 'absolute left-0 z-40 flex items-start'
+    : `absolute left-4 ${isImmersiveMode ? 'top-16' : 'top-4'} z-40`;
+  const leftToolbarWrapperStyle: React.CSSProperties | undefined = isTabletTouchLayout
+    ? {
+        top: isImmersiveMode ? 'clamp(54px, 8vh, 72px)' : 'clamp(8px, 1.6vh, 12px)',
+        bottom: isImmersiveMode ? 'clamp(116px, 18vh, 142px)' : 'clamp(86px, 12vh, 104px)',
+      }
+    : undefined;
+  const fullToolbarShellClass = isTabletInlineLayout
+    ? 'w-[clamp(48px,5.6vw,56px)] space-y-[clamp(4px,0.6vh,6px)] rounded-r-[20px] rounded-l-none border border-l-0 border-[#8cfff2]/45 bg-[linear-gradient(180deg,rgba(18,40,46,0.94),rgba(6,14,19,0.98))] px-[clamp(4px,0.6vw,5px)] py-[clamp(5px,0.7vh,6px)] shadow-[0_18px_44px_rgba(0,0,0,0.48),inset_0_1px_0_rgba(146,255,244,0.08)] backdrop-blur-xl'
+    : isTabletTouchLayout
+      ? 'w-[clamp(58px,6.6vw,68px)] max-h-full space-y-[clamp(6px,0.9vh,8px)] rounded-r-[24px] rounded-l-none border border-l-0 border-[#8cfff2]/45 bg-[linear-gradient(180deg,rgba(18,40,46,0.94),rgba(6,14,19,0.98))] px-[clamp(5px,0.8vw,7px)] py-[clamp(6px,1vh,8px)] shadow-[0_22px_60px_rgba(0,0,0,0.52),inset_0_1px_0_rgba(146,255,244,0.08)] backdrop-blur-xl'
+    : 'w-[72px] space-y-2 rounded-[24px] border border-[#8cfff2]/45 bg-[linear-gradient(180deg,rgba(18,40,46,0.92),rgba(6,14,19,0.98))] px-2 py-2 shadow-[0_22px_60px_rgba(0,0,0,0.52),inset_0_1px_0_rgba(146,255,244,0.08)] backdrop-blur-xl';
+  const fullToolbarGroupClass = isTabletInlineLayout ? 'space-y-[3px]' : isTabletTouchLayout ? 'space-y-[clamp(4px,0.8vh,6px)]' : 'space-y-1';
+  const fullToolbarToolButtonClass = isTabletInlineLayout
+    ? 'inline-flex h-[clamp(30px,3.8vh,34px)] w-full items-center justify-center rounded-[12px] border transition-all'
+    : isTabletTouchLayout
+      ? 'inline-flex h-[clamp(38px,5vh,46px)] w-full items-center justify-center rounded-[14px] border transition-all'
+    : 'inline-flex h-12 w-full items-center justify-center rounded-[16px] border transition-all';
+  const fullToolbarThicknessButtonClass = isTabletInlineLayout
+    ? 'h-[clamp(22px,3vh,26px)] w-full rounded-[9px] border'
+    : isTabletTouchLayout
+      ? 'h-[clamp(30px,4.2vh,36px)] w-full rounded-[11px] border'
+    : 'h-9 w-full rounded-[12px] border';
+  const fullToolbarActionButtonClass = isTabletInlineLayout
+    ? 'inline-flex h-[clamp(24px,3.2vh,28px)] w-full items-center justify-center rounded-[10px] border'
+    : isTabletTouchLayout
+      ? 'inline-flex h-[clamp(34px,4.6vh,40px)] w-full items-center justify-center rounded-[12px] border'
+    : 'inline-flex h-10 w-full items-center justify-center rounded-[13px] border';
+  const fullToolbarToolIconClass = isTabletInlineLayout
+    ? 'h-[clamp(16px,2.2vh,18px)] w-[clamp(16px,2.2vh,18px)]'
+    : isTabletTouchLayout
+      ? 'h-[clamp(20px,2.7vh,24px)] w-[clamp(20px,2.7vh,24px)]'
+    : 'w-6 h-6';
+  const fullToolbarActionIconClass = isTabletInlineLayout
+    ? 'h-[clamp(14px,1.9vh,16px)] w-[clamp(14px,1.9vh,16px)]'
+    : isTabletTouchLayout
+      ? 'h-[clamp(18px,2.4vh,20px)] w-[clamp(18px,2.4vh,20px)]'
+    : 'w-5 h-5';
+  const showBoardOverlayHeader = !isDisplayMode;
+  const timelineEditorModal = isTimelineEditorOpen ? (
+    <div
+      className="fixed inset-0 z-[125] flex items-center justify-center bg-black/72 px-3 py-4 backdrop-blur-sm"
+      onClick={() => setIsTimelineEditorOpen(false)}
+    >
+      <div
+        className="w-full max-w-[560px] rounded-[28px] border border-[#2d5960]/65 bg-[linear-gradient(180deg,rgba(9,22,29,0.98),rgba(5,12,18,0.96))] p-4 shadow-[0_28px_90px_rgba(0,0,0,0.45)] sm:p-5"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <h3 className="text-sm font-black uppercase tracking-[0.2em] text-[#8efdf1]">{text.timelineEditorTitle}</h3>
+            <p className="mt-1 text-xs font-semibold text-white/45">{timelineMarkers.length}</p>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={handleTimelineDeleteAll}
+              disabled={timelineMarkers.length === 0}
+              className="rounded-full border border-[#5b2d32] bg-[#261116] px-3 py-1.5 text-xs font-black uppercase tracking-[0.14em] text-[#ff9aa2] transition-colors hover:bg-[#33161c] disabled:cursor-not-allowed disabled:opacity-45"
+            >
+              {text.timelineDeleteAll}
+            </button>
+            <button
+              type="button"
+              onClick={() => setIsTimelineEditorOpen(false)}
+              className="rounded-full border border-[#2c5a61] bg-[#08141b] px-3 py-1.5 text-xs font-black uppercase tracking-[0.14em] text-white/70 transition-colors hover:bg-white/[0.08] hover:text-white"
+            >
+              {text.closeModal}
+            </button>
+          </div>
+        </div>
+
+        <div className="mt-4 max-h-[60vh] space-y-2 overflow-y-auto pr-1">
+          {timelineMarkers.length === 0 ? (
+            <div className="rounded-2xl border border-[#244e54] bg-[#08141b] px-4 py-5 text-sm text-white/60">
+              {text.timelineEditorEmpty}
+            </div>
+          ) : (
+            timelineMarkers.map((marker) => {
+              const markerStyle = TIMELINE_MARKER_STYLE[marker.type];
+              return (
+                <div
+                  key={`timeline-editor-${marker.id}`}
+                  className="flex items-center gap-3 rounded-2xl border border-[#244e54] bg-[#08141b] px-3 py-3"
+                >
+                  <div className="flex h-10 w-10 flex-shrink-0 items-center justify-center rounded-full bg-[#0d2729]">
+                    <TimelineMarkerIcon type={marker.type} color={markerStyle.color} />
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <p className="text-sm font-black text-white/85">{timelineMarkerTypeLabels[marker.type]}</p>
+                    <p className="mt-1 text-xs font-semibold tracking-[0.12em] text-white/45">
+                      {formatSecondsToClock(marker.time)}
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => handleTimelineMarkerDelete(marker.id)}
+                    className="inline-flex items-center gap-2 rounded-full border border-[#5b2d32] bg-[#261116] px-3 py-2 text-xs font-black uppercase tracking-[0.14em] text-[#ff9aa2] transition-colors hover:bg-[#33161c]"
+                  >
+                    <Trash2 className="h-4 w-4" />
+                    {text.timelineDelete}
+                  </button>
+                </div>
+              );
+            })
+          )}
+        </div>
+      </div>
+    </div>
+  ) : null;
   const boardOverlay = isBoardOpen ? (
     <div
       ref={boardOverlayScrollRef}
@@ -2828,92 +3709,94 @@ export default function SessionPage() {
       }
     >
       <div className={`w-full space-y-2 mx-auto ${isTouchLayout ? 'max-w-none my-0' : 'max-w-[1300px] my-0'}`}>
-        <div className={`rounded-2xl border border-white/20 bg-black/70 ${isTouchLayout ? 'p-2' : 'p-2 sm:p-3'}`}>
-          <div className={isTouchLayout ? '' : 'overflow-x-auto'}>
-            <div className={isTouchLayout ? 'flex flex-wrap items-center gap-2' : 'flex items-center gap-2 min-w-max'}>
-              <button
-                onClick={() => setBoardMode('move')}
-                className={`${boardControlButtonClass} ${
-                  boardMode === 'move' ? 'bg-premier-cyan text-black' : 'bg-white/10 text-white hover:bg-white/20'
-                }`}
-              >
-                {text.boardMoveMode}
-              </button>
-              <button
-                onClick={() => setBoardMode((prev) => (prev === 'draw' ? 'move' : 'draw'))}
-                className={`${boardControlButtonClass} ${
-                  boardMode === 'draw' ? 'bg-premier-pink text-white' : 'bg-white/10 text-white hover:bg-white/20'
-                }`}
-              >
-                {text.boardDrawMode}
-              </button>
-              <button
-                onClick={() =>
-                  setIsBoardGroupMove((prev) => {
-                    const next = !prev;
-                    if (!next) setBoardSelectedPieceIds([]);
-                    if (next) setIsBoardNumberEditMode(false);
-                    return next;
-                  })
-                }
-                disabled={boardMode !== 'move' || isBoardNumberEditMode}
-                className={`${boardControlButtonClass} ${
-                  isBoardGroupMove ? 'bg-premier-cyan text-black' : 'bg-white/10 text-white hover:bg-white/20'
-                } disabled:opacity-50 disabled:cursor-not-allowed`}
-              >
-                {isBoardGroupMove ? text.boardGroupMoveOn : text.boardGroupMove}
-              </button>
-              <button
-                onClick={() => setBoardSelectedPieceIds([])}
-                disabled={!isBoardGroupMove || boardSelectedPieceIds.length === 0}
-                className={`${boardControlButtonClass} bg-white/10 text-white hover:bg-white/20 disabled:opacity-50 disabled:cursor-not-allowed`}
-              >
-                {text.boardClearSelection}
-              </button>
-              <button
-                onClick={() => void handleToggleBoardNumberEditMode()}
-                disabled={boardMode !== 'move' || !canManageBoardLabels}
-                className={`${boardControlButtonClass} ${
-                  isBoardNumberEditMode ? 'bg-amber-300 text-black' : 'bg-white/10 text-white hover:bg-white/20'
-                } disabled:opacity-50 disabled:cursor-not-allowed`}
-              >
-                {isBoardNumberEditMode ? text.boardFinishEditNumbers : text.boardEditNumbers}
-              </button>
-              <button
-                onClick={() => {
-                  boardDraftRef.current = null;
-                  boardDrawPointerIdRef.current = null;
-                  setBoardDraft(null);
-                  setBoardDrawings([]);
-                  setBoardStateDirty(true);
-                }}
-                className={`${boardControlButtonClass} bg-white/10 text-white hover:bg-white/20`}
-              >
-                {text.boardClearDrawings}
-              </button>
-              <button
-                onClick={() => {
-                  if (!canManageBoardLabels) return;
-                  setBoardPieces((prev) => resetBoardPiecePositions(prev));
-                  setBoardStateDirty(true);
-                }}
-                disabled={!canManageBoardLabels}
-                className={`${boardControlButtonClass} bg-white/10 text-white hover:bg-white/20 disabled:opacity-50 disabled:cursor-not-allowed`}
-              >
-                {text.boardReset}
-              </button>
-              <button
-                onClick={() => void handleCloseBoard()}
-                className={`${boardControlButtonClass} bg-red-600 text-white hover:bg-red-500`}
-              >
-                {text.closeBoard}
-              </button>
+        {showBoardOverlayHeader && (
+          <div className={`rounded-2xl border border-white/20 bg-black/70 ${isTouchLayout ? 'p-2' : 'p-2 sm:p-3'}`}>
+            <div className={isTouchLayout ? '' : 'overflow-x-auto'}>
+              <div className={isTouchLayout ? 'flex flex-wrap items-center gap-2' : 'flex items-center gap-2 min-w-max'}>
+                <button
+                  onClick={() => setBoardMode('move')}
+                  className={`${boardControlButtonClass} ${
+                    boardMode === 'move' ? 'bg-premier-cyan text-black' : 'bg-white/10 text-white hover:bg-white/20'
+                  }`}
+                >
+                  {text.boardMoveMode}
+                </button>
+                <button
+                  onClick={() => setBoardMode((prev) => (prev === 'draw' ? 'move' : 'draw'))}
+                  className={`${boardControlButtonClass} ${
+                    boardMode === 'draw' ? 'bg-premier-pink text-white' : 'bg-white/10 text-white hover:bg-white/20'
+                  }`}
+                >
+                  {text.boardDrawMode}
+                </button>
+                <button
+                  onClick={() =>
+                    setIsBoardGroupMove((prev) => {
+                      const next = !prev;
+                      if (!next) setBoardSelectedPieceIds([]);
+                      if (next) setIsBoardNumberEditMode(false);
+                      return next;
+                    })
+                  }
+                  disabled={boardMode !== 'move' || isBoardNumberEditMode}
+                  className={`${boardControlButtonClass} ${
+                    isBoardGroupMove ? 'bg-premier-cyan text-black' : 'bg-white/10 text-white hover:bg-white/20'
+                  } disabled:opacity-50 disabled:cursor-not-allowed`}
+                >
+                  {isBoardGroupMove ? text.boardGroupMoveOn : text.boardGroupMove}
+                </button>
+                <button
+                  onClick={() => setBoardSelectedPieceIds([])}
+                  disabled={!isBoardGroupMove || boardSelectedPieceIds.length === 0}
+                  className={`${boardControlButtonClass} bg-white/10 text-white hover:bg-white/20 disabled:opacity-50 disabled:cursor-not-allowed`}
+                >
+                  {text.boardClearSelection}
+                </button>
+                <button
+                  onClick={() => void handleToggleBoardNumberEditMode()}
+                  disabled={boardMode !== 'move' || !canManageBoardLabels}
+                  className={`${boardControlButtonClass} ${
+                    isBoardNumberEditMode ? 'bg-amber-300 text-black' : 'bg-white/10 text-white hover:bg-white/20'
+                  } disabled:opacity-50 disabled:cursor-not-allowed`}
+                >
+                  {isBoardNumberEditMode ? text.boardFinishEditNumbers : text.boardEditNumbers}
+                </button>
+                <button
+                  onClick={() => {
+                    boardDraftRef.current = null;
+                    boardDrawPointerIdRef.current = null;
+                    setBoardDraft(null);
+                    setBoardDrawings([]);
+                    setBoardStateDirty(true);
+                  }}
+                  className={`${boardControlButtonClass} bg-white/10 text-white hover:bg-white/20`}
+                >
+                  {text.boardClearDrawings}
+                </button>
+                <button
+                  onClick={() => {
+                    if (!canManageBoardLabels) return;
+                    setBoardPieces((prev) => resetBoardPiecePositions(prev));
+                    setBoardStateDirty(true);
+                  }}
+                  disabled={!canManageBoardLabels}
+                  className={`${boardControlButtonClass} bg-white/10 text-white hover:bg-white/20 disabled:opacity-50 disabled:cursor-not-allowed`}
+                >
+                  {text.boardReset}
+                </button>
+                <button
+                  onClick={() => void handleCloseBoard()}
+                  className={`${boardControlButtonClass} bg-red-600 text-white hover:bg-red-500`}
+                >
+                  {text.closeBoard}
+                </button>
+              </div>
             </div>
+            <p className="text-xs text-white/65 mt-2 px-1">{text.boardHint}</p>
           </div>
-          <p className="text-xs text-white/65 mt-2 px-1">{text.boardHint}</p>
-        </div>
+        )}
 
-        {isBoardNumberEditMode && canManageBoardLabels && (
+        {showBoardOverlayHeader && isBoardNumberEditMode && canManageBoardLabels && (
           <div className="rounded-2xl border border-white/20 bg-black/70 p-3 sm:p-4 grid gap-3 md:grid-cols-2">
             <div className="rounded-xl border border-red-400/30 bg-red-500/10 p-3">
               <p className="text-sm font-bold text-red-200 mb-2">{text.teamRed}</p>
@@ -3056,12 +3939,6 @@ export default function SessionPage() {
             >
               {isImmersiveMode ? text.exitFullscreen : text.fullscreen}
             </button>
-            <button
-              onClick={handleOpenBoard}
-              className="absolute top-3 right-28 z-30 px-3 py-1 rounded bg-premier-pink/90 hover:bg-premier-pink text-white text-xs font-semibold"
-            >
-              {text.board}
-            </button>
 
             <YouTube
               key={`display-${youtubeHost}`}
@@ -3074,6 +3951,18 @@ export default function SessionPage() {
               onError={handlePlayerError}
               onEnd={handleVideoEnd}
             />
+
+            {showYoutubeThumbnailOverlay && youtubeThumbnailUrl && (
+              <div className="absolute inset-0 z-10 pointer-events-none overflow-hidden">
+                <img
+                  src={youtubeThumbnailUrl}
+                  alt={session.name}
+                  className="w-full h-full object-cover"
+                  draggable={false}
+                />
+                <div className="absolute inset-0 bg-black/20" />
+              </div>
+            )}
 
             {/* Guard zone over YouTube "Watch later / Share" controls in top-right */}
             <div className="absolute top-0 right-0 z-20 w-[176px] h-[44px] bg-black/45 pointer-events-auto rounded-bl-lg" aria-hidden="true" />
@@ -3094,88 +3983,103 @@ export default function SessionPage() {
   }
 
   return (
-    <div className="min-h-screen p-4 lg:p-6">
-      <div className="max-w-[1600px] mx-auto space-y-4">
-        <header className="bg-white/5 border border-white/10 rounded-xl px-4 py-3 flex flex-wrap items-center justify-between gap-3">
-          <div>
-            <p className="text-xs text-white/50 uppercase tracking-wide">{text.session}</p>
-            <h1 className="text-xl lg:text-2xl font-black uppercase">{session.name}</h1>
-          </div>
+    <div className="min-h-screen bg-[#03070c] bg-[radial-gradient(circle_at_top,rgba(20,60,72,0.28),transparent_38%),radial-gradient(circle_at_85%_18%,rgba(29,104,122,0.14),transparent_28%),linear-gradient(180deg,#02050a_0%,#081018_100%)] px-3 py-3 sm:px-4 sm:py-4 lg:px-6 lg:py-5">
+      <div className="mx-auto max-w-[1700px] space-y-4">
+        <header className="rounded-[28px] border border-[#3ce7d2]/15 bg-[linear-gradient(180deg,rgba(11,22,30,0.95),rgba(6,13,19,0.9))] px-4 py-4 shadow-[0_22px_80px_rgba(0,0,0,0.42)] sm:px-5">
+          <div className="flex flex-wrap items-center justify-between gap-4">
+            <div className="space-y-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="rounded-full border border-[#56f2e0]/30 bg-[#0a141c]/80 px-3 py-1 text-[10px] font-black uppercase tracking-[0.24em] text-[#81fff1]">
+                  {text.session}
+                </span>
+                <span className="rounded-full border border-white/10 bg-white/[0.03] px-3 py-1 text-[10px] font-bold uppercase tracking-[0.24em] text-white/65">
+                  {text.users} {participantsCountLabel}
+                </span>
+              </div>
+              <div>
+                <h1 className="text-xl font-black uppercase tracking-[0.14em] text-white sm:text-2xl lg:text-[2rem]">
+                  {session.name}
+                </h1>
+                <p className="mt-1 max-w-[760px] text-sm text-[#8ba4ad] sm:text-[15px]">
+                  {text.coachUiSubtitle}
+                </p>
+              </div>
+            </div>
 
-          <div className="flex items-center gap-2 flex-wrap">
-            <span className={`px-3 py-1 rounded-full text-xs font-black uppercase tracking-wider ${
-              user?.plan === 'pro'
-                ? 'bg-premier-cyan/20 text-premier-cyan'
-                : user?.plan === 'coach'
-                  ? 'bg-premier-pink/20 text-premier-pink'
-                  : 'bg-white/10 text-white/60'
-            }`}>
-              {user?.plan || text.viewer}
-            </span>
+            <div className="flex flex-wrap items-center gap-2">
+              <span className={`rounded-full border px-3 py-2 text-xs font-black uppercase tracking-[0.18em] ${
+                user?.plan === 'pro'
+                  ? 'border-[#4df8e6]/35 bg-[#4df8e6]/12 text-[#7afef1]'
+                  : user?.plan === 'coach'
+                    ? 'border-[#d8c05e]/35 bg-[#d8c05e]/12 text-[#e9d886]'
+                    : 'border-white/10 bg-white/[0.05] text-white/60'
+              }`}>
+                {user?.plan || text.viewer}
+              </span>
 
-            <span className="px-3 py-1 rounded-full bg-white/10 text-white/80 text-xs font-bold uppercase">
-              {text.users} {participantsCountLabel}
-            </span>
+              <Link
+                href={`/display/${session.id}`}
+                target="_blank"
+                className="rounded-full border border-[#2c6267] bg-[#0b171d] px-4 py-2 text-xs font-black uppercase tracking-[0.16em] text-[#8cf7ea] transition-colors hover:bg-[#10212a]"
+              >
+                {text.openDisplay}
+              </Link>
 
-            <Link href="/dashboard" className="btn-primary px-4 py-2 text-sm">
-              {text.exit}
-            </Link>
+              <Link
+                href="/dashboard"
+                className="rounded-full border border-white/10 bg-white/[0.06] px-4 py-2 text-xs font-black uppercase tracking-[0.16em] text-white transition-colors hover:bg-white/[0.11]"
+              >
+                {text.exit}
+              </Link>
+            </div>
           </div>
         </header>
 
-        <section className="bg-white/5 border border-premier-cyan/30 rounded-xl px-4 py-4 lg:px-5">
-          <p className="text-sm lg:text-base font-black uppercase tracking-wide text-premier-cyan">{text.coachUiTitle}</p>
-          <p className="text-sm lg:text-base text-white/80 mt-1">{text.coachUiSubtitle}</p>
-        </section>
-
-        <div className="grid xl:grid-cols-[1fr_300px] gap-4">
+        <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_320px]">
           <div className="space-y-4">
-            <div
-              ref={wrapperRef}
-              className={`bg-black overflow-hidden ${
-                isPseudoFullscreen
-                  ? 'fixed inset-0 z-[80]'
-                  : 'relative w-full aspect-video rounded-xl border border-white/10'
-              }`}
-              style={VIDEO_INTERACTION_SURFACE_STYLE}
-              onDoubleClick={(event) => event.preventDefault()}
-            >
+            <section className="rounded-[34px] border border-[#28535a]/55 bg-[linear-gradient(180deg,rgba(7,19,24,0.98),rgba(5,12,18,0.95))] p-2 shadow-[0_28px_110px_rgba(0,0,0,0.48)] sm:p-3 lg:p-4">
+              <div className="rounded-[28px] border border-[#132d33] bg-[linear-gradient(180deg,rgba(6,14,20,0.98),rgba(4,10,14,0.92))] p-2 sm:p-3">
+                <div
+                  ref={wrapperRef}
+                  className={`bg-black overflow-hidden ${
+                    isPseudoFullscreen
+                      ? 'fixed inset-0 z-[80]'
+                      : 'relative w-full aspect-video rounded-[28px] border border-[#77f9e7]/20 shadow-[0_36px_120px_rgba(0,0,0,0.5)]'
+                  }`}
+                  style={VIDEO_INTERACTION_SURFACE_STYLE}
+                  onDoubleClick={(event) => event.preventDefault()}
+                >
+                  <div className="pointer-events-none absolute inset-0 z-[1] bg-[radial-gradient(circle_at_top,rgba(0,0,0,0.06),transparent_35%),linear-gradient(180deg,rgba(3,9,14,0.18),transparent_22%,transparent_78%,rgba(2,8,12,0.38)_100%)]" />
+                  <div className="pointer-events-none absolute inset-0 z-[2] shadow-[inset_0_0_0_1px_rgba(110,255,240,0.14),inset_0_-72px_120px_rgba(0,0,0,0.36)]" />
               {showSessionDemoTimer && (
-                <div className="absolute top-3 left-1/2 -translate-x-1/2 z-50 pointer-events-none">
-                  <div className="px-4 py-1.5 rounded-full bg-black/60 border border-ucl-gold/75 text-ucl-gold text-sm font-black tabular-nums shadow-[0_6px_24px_rgba(0,0,0,0.45)]">
+                <div className="absolute top-4 left-1/2 -translate-x-1/2 z-50 pointer-events-none">
+                  <div className="rounded-full border border-[#d8c05e]/55 bg-black/65 px-4 py-1.5 text-sm font-black tabular-nums text-[#e8d37f] shadow-[0_6px_24px_rgba(0,0,0,0.45)]">
                     {demoTimerLabel}
                   </div>
                 </div>
               )}
-              <div className="absolute top-3 right-3 z-40 flex items-center gap-1 sm:gap-2">
+              <div className="absolute top-4 right-4 z-40 flex items-center gap-2">
                 {showTopActionBar && (
-                  <div className="flex items-center gap-1 sm:gap-2 rounded-xl border border-white/15 bg-[#0c1523]/85 backdrop-blur-sm px-1.5 sm:px-2 py-1.5">
+                  <div className="flex flex-wrap items-center justify-end gap-2">
                     <button
                       onClick={() => setIsCanvasEnabled((prev) => !prev)}
-                      className={`h-9 px-2 sm:px-4 rounded text-sm font-bold inline-flex items-center gap-1.5 ${
+                      className={`h-9 rounded-full border border-white/12 px-3 text-[11px] font-black uppercase tracking-[0.16em] inline-flex items-center gap-2 backdrop-blur-md transition-colors ${
                         isCanvasEnabled
-                          ? 'bg-[#15c7a8] text-black hover:bg-[#3dd9be]'
-                          : 'bg-white/15 text-white hover:bg-white/25'
+                          ? 'bg-[#63f6e7] text-[#021013] hover:bg-[#8af9ed]'
+                          : 'bg-black/55 text-white/80 hover:bg-black/70'
                       }`}
                       title={text.canvasToggleTitle}
                     >
-                      {isCanvasEnabled ? <PencilLine className="w-4 h-4 flex-shrink-0" /> : <Slash className="w-4 h-4 flex-shrink-0" />}
+                      {isCanvasEnabled ? <PencilLine className="h-4 w-4 flex-shrink-0" /> : <Slash className="h-4 w-4 flex-shrink-0" />}
                       <span className="hidden sm:inline">{isCanvasEnabled ? text.canvasOn : text.canvasOff}</span>
                     </button>
 
                     <button
                       onClick={handleToggleFullscreen}
-                      className="h-9 px-2 sm:px-4 rounded bg-black/50 hover:bg-black/70 text-white text-sm font-semibold inline-flex items-center gap-1.5"
+                      className="inline-flex items-center gap-2 bg-transparent px-0 py-0 text-[11px] font-black uppercase tracking-[0.16em] text-white drop-shadow-[0_2px_8px_rgba(0,0,0,0.75)] transition-opacity hover:opacity-80"
                     >
-                      {isImmersiveMode ? <Minimize2 className="w-4 h-4 flex-shrink-0" /> : <Maximize2 className="w-4 h-4 flex-shrink-0" />}
+                      {isImmersiveMode ? <Minimize2 className="h-4 w-4 flex-shrink-0" /> : <Maximize2 className="h-4 w-4 flex-shrink-0" />}
                       <span className="hidden sm:inline">{isImmersiveMode ? text.exitFullscreen : text.fullscreen}</span>
-                    </button>
-
-                    <button
-                      onClick={handleOpenBoard}
-                      className="h-9 px-2 sm:px-4 rounded bg-[#1d4ed8] hover:bg-[#2563eb] text-white text-sm font-semibold"
-                    >
-                      {text.board}
                     </button>
                   </div>
                 )}
@@ -3183,28 +4087,28 @@ export default function SessionPage() {
                 {isTouchLayout && (
                   <button
                     onClick={() => setIsTopTouchBarCollapsed((prev) => !prev)}
-                    className="h-9 w-9 rounded-lg border border-white/15 bg-black/70 hover:bg-black/80 text-white inline-flex items-center justify-center"
+                    className="h-10 w-10 rounded-full border border-white/10 bg-[#071118]/82 text-white inline-flex items-center justify-center backdrop-blur-md transition-colors hover:bg-[#0d1821]"
                     title={showTopActionBar ? text.hideControls : text.showControls}
                   >
-                    {showTopActionBar ? <ChevronRight className="w-5 h-5" /> : <ChevronLeft className="w-5 h-5" />}
+                    {showTopActionBar ? <ChevronRight className="h-5 w-5" /> : <ChevronLeft className="h-5 w-5" />}
                   </button>
                 )}
               </div>
 
               {!isDisplayMode && (!isImmersiveMode || showImmersiveControls || isTouchLayout) && (
                 <>
-                  <div className={`absolute left-3 ${isImmersiveMode ? 'top-14' : 'top-3'} z-40`}>
-                    {isTouchLayout ? (
+                  <div className={leftToolbarWrapperClass} style={leftToolbarWrapperStyle}>
+                    {isCompactTouchLayout ? (
                       <div className="flex items-start gap-2">
-                        <div className="rounded-xl border border-white/30 bg-[#0c1523] shadow-lg px-1.5 py-1.5 w-[58px] space-y-1">
+                        <div className="w-[58px] space-y-1 rounded-[22px] border border-[#8cfff2]/45 bg-[linear-gradient(180deg,rgba(18,40,46,0.92),rgba(6,14,19,0.98))] px-1.5 py-2 shadow-[0_22px_60px_rgba(0,0,0,0.52),inset_0_1px_0_rgba(146,255,244,0.08)] backdrop-blur-xl">
                           <div className="space-y-1">
                             <button
                               onClick={handleMobilePencilSelect}
                               disabled={!canDraw}
-                              className={`w-full h-10 rounded-md transition-colors inline-flex items-center justify-center ${
+                              className={`inline-flex h-10 w-full items-center justify-center rounded-[14px] border transition-all ${
                                 activeTool === 'freehand'
-                                  ? 'bg-[#15c7a8] text-black'
-                                  : 'bg-white/10 text-white hover:bg-white/20'
+                                  ? 'border-[#8cfff2]/75 bg-[#12343a]/96 text-[#98fff4] shadow-[0_0_28px_rgba(102,255,237,0.22)]'
+                                  : 'border-transparent bg-[#0b161d]/78 text-[#85f6ea] hover:border-[#69f7e5]/35 hover:bg-[#112029]/92'
                               } disabled:opacity-40 disabled:cursor-not-allowed`}
                               title={`${toolLabels.freehand} (B)`}
                             >
@@ -3214,10 +4118,10 @@ export default function SessionPage() {
                             <button
                               onClick={handleMobileShapeMenuToggle}
                               disabled={!canDraw}
-                              className={`w-full h-10 rounded-md transition-colors inline-flex items-center justify-center ${
+                              className={`inline-flex h-10 w-full items-center justify-center rounded-[14px] border transition-all ${
                                 isShapeToolActive || isMobileShapeMenuOpen
-                                  ? 'bg-[#15c7a8] text-black'
-                                  : 'bg-white/10 text-white hover:bg-white/20'
+                                  ? 'border-[#8cfff2]/75 bg-[#12343a]/96 text-[#98fff4] shadow-[0_0_28px_rgba(102,255,237,0.22)]'
+                                  : 'border-transparent bg-[#0b161d]/78 text-[#85f6ea] hover:border-[#69f7e5]/35 hover:bg-[#112029]/92'
                               } disabled:opacity-40 disabled:cursor-not-allowed`}
                               title={`${toolLabels.arrow} / ${toolLabels.circle} / ${toolLabels.line}`}
                             >
@@ -3227,10 +4131,10 @@ export default function SessionPage() {
                             <button
                               onClick={() => handleToolSelect('text')}
                               disabled={!canDraw}
-                              className={`w-full h-10 rounded-md transition-colors inline-flex items-center justify-center ${
+                              className={`inline-flex h-10 w-full items-center justify-center rounded-[14px] border transition-all ${
                                 activeTool === 'text'
-                                  ? 'bg-[#15c7a8] text-black'
-                                  : 'bg-white/10 text-white hover:bg-white/20'
+                                  ? 'border-[#8cfff2]/75 bg-[#12343a]/96 text-[#98fff4] shadow-[0_0_28px_rgba(102,255,237,0.22)]'
+                                  : 'border-transparent bg-[#0b161d]/78 text-[#85f6ea] hover:border-[#69f7e5]/35 hover:bg-[#112029]/92'
                               } disabled:opacity-40 disabled:cursor-not-allowed`}
                               title={`${toolLabels.text} (T)`}
                             >
@@ -3240,14 +4144,14 @@ export default function SessionPage() {
                         </div>
 
                         {isMobileThicknessOpen && (
-                          <div className="rounded-xl border border-[#15c7a8]/40 bg-[#0c1523]/95 shadow-lg px-1.5 py-1.5 w-[58px] space-y-1">
+                          <div className="w-[58px] space-y-1 rounded-[22px] border border-[#8cfff2]/45 bg-[linear-gradient(180deg,rgba(18,40,46,0.92),rgba(6,14,19,0.98))] px-1.5 py-2 shadow-[0_22px_60px_rgba(0,0,0,0.52),inset_0_1px_0_rgba(146,255,244,0.08)] backdrop-blur-xl">
                             {[2, 4, 6].map((w) => (
                               <button
                                 key={`left-mobile-thickness-freehand-${w}`}
                                 onClick={() => handleThicknessSelect(w)}
                                 disabled={!canDraw}
-                                className={`w-full h-10 rounded-md border transition-colors ${
-                                  lineThickness === w ? 'border-[#15c7a8] bg-[#15c7a8]/20' : 'border-white/20 bg-white/10'
+                                className={`h-10 w-full rounded-[14px] border transition-colors ${
+                                  lineThickness === w ? 'border-[#8cfff2]/65 bg-[#12343a]/96' : 'border-transparent bg-[#0b161d]/78 hover:border-[#69f7e5]/35 hover:bg-[#112029]/92'
                                 } disabled:opacity-40 disabled:cursor-not-allowed`}
                                 title={`${text.thickness} ${w}px`}
                               >
@@ -3258,16 +4162,16 @@ export default function SessionPage() {
                         )}
 
                         {isMobileShapeMenuOpen && (
-                          <div className="rounded-xl border border-[#15c7a8]/40 bg-[#0c1523]/95 shadow-lg px-1.5 py-1.5 w-[58px] space-y-1">
+                          <div className="w-[58px] space-y-1 rounded-[22px] border border-[#8cfff2]/45 bg-[linear-gradient(180deg,rgba(18,40,46,0.92),rgba(6,14,19,0.98))] px-1.5 py-2 shadow-[0_22px_60px_rgba(0,0,0,0.52),inset_0_1px_0_rgba(146,255,244,0.08)] backdrop-blur-xl">
                             {MOBILE_SHAPE_TOOLS.map((tool) => (
                               <button
                                 key={`left-mobile-shape-${tool}`}
                                 onClick={() => handleMobileShapeSelect(tool)}
                                 disabled={!canDraw}
-                                className={`w-full h-10 rounded-md transition-colors inline-flex items-center justify-center ${
+                                className={`inline-flex h-10 w-full items-center justify-center rounded-[14px] border transition-all ${
                                   activeTool === tool
-                                    ? 'bg-[#15c7a8] text-black'
-                                    : 'bg-white/10 text-white hover:bg-white/20'
+                                    ? 'border-[#8cfff2]/75 bg-[#12343a]/96 text-[#98fff4] shadow-[0_0_28px_rgba(102,255,237,0.22)]'
+                                    : 'border-transparent bg-[#0b161d]/78 text-[#85f6ea] hover:border-[#69f7e5]/35 hover:bg-[#112029]/92'
                                 } disabled:opacity-40 disabled:cursor-not-allowed`}
                                 title={toolLabels[tool]}
                               >
@@ -3279,69 +4183,75 @@ export default function SessionPage() {
                       </div>
                     ) : (
                       <div>
-                        <div className="rounded-xl border border-white/30 bg-[#0c1523] shadow-lg px-2 py-2 w-[72px] space-y-2">
-                          <div className="space-y-1">
+                        <div className={fullToolbarShellClass}>
+                          <div className={fullToolbarGroupClass}>
                             {TOOL_OPTIONS.map(({ tool, shortcut }) => (
                               <button
                                 key={`left-${tool}`}
                                 onClick={() => handleToolSelect(tool)}
                                 disabled={!canDraw}
-                                className={`w-full h-12 rounded-lg transition-colors inline-flex items-center justify-center ${
+                                className={`${fullToolbarToolButtonClass} ${
                                   activeTool === tool
-                                    ? 'bg-[#15c7a8] text-black'
-                                    : 'bg-white/10 text-white hover:bg-white/20'
+                                    ? 'border-[#8cfff2]/75 bg-[#12343a]/96 text-[#98fff4] shadow-[0_0_28px_rgba(102,255,237,0.22)]'
+                                    : 'border-transparent bg-[#0b161d]/78 text-[#85f6ea] hover:border-[#69f7e5]/35 hover:bg-[#112029]/92'
                                 } disabled:opacity-40 disabled:cursor-not-allowed`}
                                 title={`${toolLabels[tool]} (${shortcut})`}
                               >
-                                <ToolIcon tool={tool} className="w-6 h-6" />
+                                <ToolIcon tool={tool} className={fullToolbarToolIconClass} />
                               </button>
                             ))}
                           </div>
 
-                          <div className="h-px bg-white/15" />
+                          <div className="h-px bg-[#77f9e7]/15" />
 
-                          <div className="space-y-1">
+                          <div className={fullToolbarGroupClass}>
                             {[2, 4, 6].map((w) => (
                               <button
                                 key={`left-thickness-${w}`}
                                 onClick={() => handleThicknessSelect(w)}
                                 disabled={!canDraw}
-                                className={`w-full h-9 rounded-md border ${
-                                  lineThickness === w ? 'border-[#15c7a8] bg-[#15c7a8]/20' : 'border-white/20 bg-white/10'
+                                className={`${fullToolbarThicknessButtonClass} ${
+                                  lineThickness === w ? 'border-[#8cfff2]/65 bg-[#79ffe9]/16' : 'border-transparent bg-white/[0.04] hover:border-[#69f7e5]/25 hover:bg-white/[0.08]'
                                 } disabled:opacity-40 disabled:cursor-not-allowed`}
                                 title={`${text.thickness} ${w}px`}
                               >
-                                <span className="block bg-white mx-auto rounded" style={{ width: '20px', height: `${Math.max(2, Math.min(6, w))}px` }} />
+                                <span
+                                  className="block bg-white mx-auto rounded"
+                                  style={{
+                                    width: isTabletTouchLayout ? '18px' : '20px',
+                                    height: `${Math.max(2, Math.min(6, w))}px`,
+                                  }}
+                                />
                               </button>
                             ))}
                           </div>
 
-                          <div className="h-px bg-white/15" />
+                          <div className="h-px bg-[#77f9e7]/15" />
 
-                          <div className="space-y-1">
+                          <div className={fullToolbarGroupClass}>
                             <button
                               onClick={handleUndo}
                               disabled={!canUndo}
-                              className="w-full h-10 rounded-md bg-white/10 text-white hover:bg-white/20 disabled:opacity-40 disabled:cursor-not-allowed inline-flex items-center justify-center"
+                              className={`${fullToolbarActionButtonClass} border-transparent bg-white/[0.04] text-[#8efdf1] transition-colors hover:border-[#69f7e5]/25 hover:bg-white/[0.08] disabled:opacity-40 disabled:cursor-not-allowed`}
                               title={text.undoHint}
                             >
-                              <Undo2 className="w-5 h-5" />
+                              <Undo2 className={fullToolbarActionIconClass} />
                             </button>
                             <button
                               onClick={handleRedo}
                               disabled={!canRedo}
-                              className="w-full h-10 rounded-md bg-white/10 text-white hover:bg-white/20 disabled:opacity-40 disabled:cursor-not-allowed inline-flex items-center justify-center"
+                              className={`${fullToolbarActionButtonClass} border-transparent bg-white/[0.04] text-[#8efdf1] transition-colors hover:border-[#69f7e5]/25 hover:bg-white/[0.08] disabled:opacity-40 disabled:cursor-not-allowed`}
                               title={text.redoHint}
                             >
-                              <Redo2 className="w-5 h-5" />
+                              <Redo2 className={fullToolbarActionIconClass} />
                             </button>
                             <button
                               onClick={handleClear}
                               disabled={!canDraw}
-                              className="w-full h-10 rounded-md bg-red-500/20 text-red-200 hover:bg-red-500/35 disabled:opacity-40 disabled:cursor-not-allowed inline-flex items-center justify-center"
+                              className={`${fullToolbarActionButtonClass} border-transparent bg-[#5c171d]/45 text-[#ff9da5] transition-colors hover:bg-[#752128]/55 disabled:opacity-40 disabled:cursor-not-allowed`}
                               title={text.clearAll}
                             >
-                              <Trash2 className="w-5 h-5" />
+                              <Trash2 className={fullToolbarActionIconClass} />
                             </button>
                           </div>
                         </div>
@@ -3349,13 +4259,13 @@ export default function SessionPage() {
                     )}
                   </div>
 
-                  {isTouchLayout && (
-                    <div className={`absolute right-3 ${isImmersiveMode ? 'top-20' : 'top-8'} z-40`}>
-                      <div className="rounded-xl border border-white/30 bg-[#0c1523] shadow-lg px-1.5 py-1.5 w-[58px] space-y-1">
+                  {isCompactTouchLayout && (
+                    <div className={`absolute right-4 ${isImmersiveMode ? 'top-20' : 'top-10'} z-40`}>
+                      <div className="w-[58px] space-y-1 rounded-[22px] border border-[#8cfff2]/45 bg-[linear-gradient(180deg,rgba(18,40,46,0.92),rgba(6,14,19,0.98))] px-1.5 py-2 shadow-[0_22px_60px_rgba(0,0,0,0.52),inset_0_1px_0_rgba(146,255,244,0.08)] backdrop-blur-xl">
                         <button
                           onClick={handleUndo}
                           disabled={!canUndo}
-                          className="w-full h-10 rounded-md bg-white/10 text-white hover:bg-white/20 disabled:opacity-40 disabled:cursor-not-allowed inline-flex items-center justify-center"
+                          className="inline-flex h-10 w-full items-center justify-center rounded-[14px] border border-transparent bg-white/[0.04] text-[#8efdf1] transition-colors hover:border-[#69f7e5]/25 hover:bg-white/[0.08] disabled:opacity-40 disabled:cursor-not-allowed"
                           title={text.undoHint}
                         >
                           <Undo2 className="w-5 h-5" />
@@ -3363,7 +4273,7 @@ export default function SessionPage() {
                         <button
                           onClick={handleClear}
                           disabled={!canDraw}
-                          className="w-full h-10 rounded-md bg-red-500/20 text-red-200 hover:bg-red-500/35 disabled:opacity-40 disabled:cursor-not-allowed inline-flex items-center justify-center"
+                          className="inline-flex h-10 w-full items-center justify-center rounded-[14px] border border-transparent bg-[#5c171d]/45 text-[#ff9da5] transition-colors hover:bg-[#752128]/55 disabled:opacity-40 disabled:cursor-not-allowed"
                           title={text.clearAll}
                         >
                           <Trash2 className="w-5 h-5" />
@@ -3399,6 +4309,23 @@ export default function SessionPage() {
                 onEnd={handleVideoEnd}
               />
 
+              {showYoutubeThumbnailOverlay && youtubeThumbnailUrl && (
+                <div className="absolute inset-0 z-10 pointer-events-none overflow-hidden">
+                  <img
+                    src={youtubeThumbnailUrl}
+                    alt={session.name}
+                    className="w-full h-full object-cover"
+                    draggable={false}
+                  />
+                  <div className="absolute inset-0 bg-black/20" />
+                  <div className="absolute inset-0 flex items-center justify-center">
+                    <div className="w-20 h-14 rounded-2xl bg-[#ff0033]/90 shadow-[0_18px_48px_rgba(0,0,0,0.4)] flex items-center justify-center">
+                      <Play className="w-9 h-9 text-white fill-current ml-1" />
+                    </div>
+                  </div>
+                </div>
+              )}
+
               {/* Guard zone over YouTube "Watch later / Share" controls in top-right */}
               <div className="absolute top-0 right-0 z-20 w-[176px] h-[44px] bg-black/45 pointer-events-auto rounded-bl-lg" aria-hidden="true" />
 
@@ -3422,62 +4349,182 @@ export default function SessionPage() {
                 onPointerMove={handleCanvasPointerMove}
                 onPointerUp={handleCanvasPointerUp}
                 onPointerCancel={handleCanvasPointerUp}
+                onLostPointerCapture={() => finalizeCurrentDraft()}
               />
 
               {isImmersiveMode && showImmersiveControls && (
-                <>
-                  <div className="absolute inset-x-0 bottom-0 z-40 p-2 sm:p-3 pointer-events-none">
-                    <div className="pointer-events-auto rounded-lg border border-white/20 bg-[#0c1523]/82 backdrop-blur-md px-3 py-2 space-y-2 transition-all duration-300 translate-y-0 opacity-100">
+                <div className="absolute inset-x-0 bottom-0 z-40 p-2 sm:p-2.5 pointer-events-none">
+                  <div className="pointer-events-auto mx-auto max-w-[1480px] rounded-[24px] border border-[#2d5960]/60 bg-[linear-gradient(180deg,rgba(9,22,29,0.9),rgba(5,12,18,0.84))] px-2.5 py-1.5 shadow-[0_24px_70px_rgba(0,0,0,0.4),inset_0_1px_0_rgba(255,255,255,0.03)] backdrop-blur-xl sm:px-3 sm:py-2">
+                    <div className="relative">
+                      <div
+                        data-timeline-rail="1"
+                        className="relative h-7 overflow-visible rounded-[16px] border border-[#275754]/55 bg-[linear-gradient(180deg,rgba(7,35,31,0.82),rgba(5,24,23,0.92))]"
+                        onPointerDown={handleTimelineRailPointerDown}
+                        onPointerMove={handleTimelinePointerMove}
+                        onPointerUp={handleTimelinePointerUp}
+                        onPointerCancel={handleTimelinePointerUp}
+                      >
+                        <div className="absolute inset-x-2 top-1/2 h-px -translate-y-1/2 bg-[#62f7e8]/20" />
+                        {DECORATIVE_TIMELINE_COLUMNS.map((column) => {
+                          const tone = TIMELINE_TONE_STYLE[column.tone];
+                          const isActive = playbackProgress >= column.position;
+                          return (
+                            <div
+                              key={`imm-timeline-column-${column.position}`}
+                              className="absolute bottom-[3px] w-[2px] rounded-full"
+                              style={{
+                                left: getTimelineAlignedLeft(column.position, -1),
+                                height: `${column.height}px`,
+                                backgroundColor: isActive ? tone.active : tone.inactive,
+                                boxShadow: isActive ? `0 0 10px ${tone.glow}` : 'none',
+                              }}
+                            />
+                          );
+                        })}
+                        {timelineMarkers.map((marker) => {
+                          const markerStyle = TIMELINE_MARKER_STYLE[marker.type];
+                          const leftPercent = safeDuration > 0 ? clamp((marker.time / safeDuration) * 100, 0, 100) : 0;
+                          return (
+                            <button
+                              key={`imm-session-marker-${marker.id}`}
+                              type="button"
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                handleTimelineMarkerClick(marker);
+                              }}
+                              onPointerDown={(event) => handleTimelineMarkerPointerDown(event, marker)}
+                              onPointerMove={handleTimelinePointerMove}
+                              onPointerUp={handleTimelinePointerUp}
+                              onPointerCancel={handleTimelinePointerUp}
+                              className="absolute top-[-28px] z-10 h-[50px] w-8 -translate-x-1/2"
+                              style={{ left: getTimelineAlignedLeft(leftPercent) }}
+                              title={`${timelineMarkerTypeLabels[marker.type]} • ${formatSecondsToClock(marker.time)}`}
+                            >
+                              <span className="pointer-events-none absolute inset-0 flex flex-col items-center pb-[2px]">
+                                <span className="drop-shadow-[0_0_10px_rgba(0,0,0,0.48)]">
+                                  <TimelineMarkerIcon type={marker.type} color={markerStyle.color} />
+                                </span>
+                                <span
+                                  className="mt-[1px] w-[2.5px] flex-1 rounded-full"
+                                  style={{
+                                    backgroundColor: markerStyle.color,
+                                    boxShadow: `0 0 12px ${markerStyle.glow}`,
+                                  }}
+                                />
+                              </span>
+                            </button>
+                          );
+                        })}
+                        <div
+                        className="absolute inset-y-[4px] z-[1] w-[2px] rounded-full bg-[#dbffff] shadow-[0_0_18px_rgba(219,255,255,0.78)]"
+                          style={{ left: getTimelineAlignedLeft(playbackProgress, -1) }}
+                        />
+                      </div>
+                      {timelineMenuState && (
+                        <div
+                          data-timeline-menu="1"
+                          className="absolute bottom-full z-20 mb-2 -translate-x-1/2"
+                          style={{ left: getTimelineAlignedLeft(timelineMenuState.leftPercent) }}
+                        >
+                          <div className="flex min-w-[170px] flex-col gap-1 rounded-2xl border border-[#2c5a61] bg-[#08141b]/95 p-2 shadow-[0_16px_48px_rgba(0,0,0,0.42)] backdrop-blur-xl">
+                            {TIMELINE_MARKER_TYPES.map((type) => {
+                              const markerStyle = TIMELINE_MARKER_STYLE[type];
+                              return (
+                                <button
+                                  key={`imm-menu-${type}`}
+                                  type="button"
+                                  onClick={() => handleTimelineMenuSelect(type)}
+                                  className="flex items-center gap-2.5 rounded-xl border px-3 py-2 text-left text-sm font-black text-white/85 transition-colors hover:bg-white/[0.08]"
+                                  style={{ borderColor: markerStyle.color }}
+                                >
+                                  <TimelineMarkerIcon type={type} color={markerStyle.color} />
+                                  {timelineMarkerTypeLabels[type]}
+                                </button>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="relative mt-1.5 h-4">
+                      <div className="absolute inset-x-2 top-1/2 h-[2px] -translate-y-1/2 rounded-full bg-[#1a2930]">
+                        <div
+                          className="h-full rounded-full bg-gradient-to-r from-[#5ff7e8] via-[#4bd6ff] to-[#87dfff]"
+                          data-progress-fill="1"
+                          style={{ width: `${playbackProgress}%` }}
+                        />
+                      </div>
+                      <input
+                        type="range"
+                        min={0}
+                        max={safeDuration}
+                        step={0.1}
+                        value={clampedCurrentTime}
+                        onChange={(e) => handleSeek(Number(e.target.value), true)}
+                        className="broadcast-range absolute inset-0 z-10 w-full"
+                      />
+                    </div>
+
+                    <div className="mt-2 flex flex-wrap items-center justify-between gap-1.5">
                       <div className="flex flex-wrap items-center gap-1.5">
+                      <div className="flex items-center gap-1 rounded-full border border-[#2c5a61] bg-[#08141b] p-[3px]">
                         <button
-                          onClick={() => handleSeek(currentTime - 10, true)}
-                          className="px-3 py-1.5 rounded-md bg-white/10 hover:bg-white/20 text-xs sm:text-sm"
+                          onClick={() => handleSeek(currentTime - 5, true)}
+                          className="inline-flex h-8 min-w-[54px] items-center justify-center gap-1 rounded-full border border-white/10 bg-white/[0.05] px-2 text-[11px] font-black tracking-[0.08em] text-white transition-colors hover:bg-white/[0.1]"
+                          title="-5s"
                         >
-                          -10s
+                          <ChevronLeft className="h-4 w-4" />
+                          <span>-5s</span>
                         </button>
                         <button
-                          onClick={() => handleSeek(currentTime + 10, true)}
-                          className="px-3 py-1.5 rounded-md bg-white/10 hover:bg-white/20 text-xs sm:text-sm"
+                          onClick={handlePlayPause}
+                          disabled={!isPlayerReady}
+                          className="flex h-8 w-8 items-center justify-center rounded-full border border-[#79ffe9]/40 bg-[#63f6e7]/18 text-[#90fff3] transition-colors hover:bg-[#63f6e7]/24 disabled:cursor-not-allowed disabled:opacity-50"
+                          title={isPlaying ? text.pause : text.play}
                         >
-                          +10s
+                          {isPlaying ? <Pause className="h-4 w-4" /> : <Play className="h-4 w-4 fill-current" />}
                         </button>
                         <button
-                          onClick={handleOpenBoard}
-                          className="px-3 py-1.5 rounded-md bg-[#1d4ed8] hover:bg-[#2563eb] text-xs sm:text-sm font-semibold"
+                          onClick={() => handleSeek(currentTime + 5, true)}
+                          className="inline-flex h-8 min-w-[54px] items-center justify-center gap-1 rounded-full border border-white/10 bg-white/[0.05] px-2 text-[11px] font-black tracking-[0.08em] text-white transition-colors hover:bg-white/[0.1]"
+                          title="+5s"
                         >
-                          {text.board}
+                          <span>+5s</span>
+                          <ChevronRight className="h-4 w-4" />
                         </button>
-                        <select
-                          value={playbackRate}
-                          onChange={(e) => handlePlaybackRate(Number(e.target.value))}
-                          className="px-2 py-1.5 rounded-md bg-black/70 border border-white/20 text-xs sm:text-sm"
+                      </div>
+
+                      {renderPlaybackRateControl('imm-broadcast-speed')}
+
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setTimelineMenuState(null);
+                          setIsTimelineEditorOpen(true);
+                        }}
+                        className="inline-flex h-9 items-center gap-2 rounded-full border border-[#2c5d63] bg-[#0d1821] px-3 text-[11px] font-black uppercase tracking-[0.14em] text-[#8efdf1] transition-colors hover:bg-[#12212d]"
+                      >
+                        <PencilLine className="h-4 w-4" />
+                        {text.timelineMarkersButton}
+                      </button>
+
+                      {renderQualityControl('imm-broadcast-quality')}
+
+                      <div className="flex items-center gap-2 rounded-full border border-[#2c5a61] bg-[#08141b] px-2.5 py-0.5">
+                        <button
+                          onClick={handleMuteToggle}
+                          className="text-white/85 transition-colors hover:text-white"
+                          title={isMuted ? 'Включить звук' : 'Выключить звук'}
                         >
-                          {PLAYBACK_RATES.map((rate) => (
-                            <option key={rate} value={rate}>
-                              {rate}x
-                            </option>
-                          ))}
-                        </select>
-                        <select
-                          value={qualityPreference}
-                          onChange={(e) => handleQualityChange(e.target.value)}
-                          className="px-2 py-1.5 rounded-md bg-black/70 border border-white/20 text-xs sm:text-sm"
-                          aria-label={text.quality}
-                        >
-                          {qualityOptions.map((option) => (
-                            <option key={`imm-quality-${option.value}`} value={option.value}>
-                              {option.label}
-                            </option>
-                          ))}
-                        </select>
-                        <div className="flex items-center gap-1">
-                          <button
-                            onClick={handleMuteToggle}
-                            className="min-h-10 w-9 rounded-md bg-white/10 hover:bg-white/20 inline-flex items-center justify-center flex-shrink-0"
-                            title={isMuted ? 'Включить звук' : 'Выключить звук'}
-                          >
-                            {isMuted ? <VolumeX className="w-4 h-4" /> : <Volume2 className="w-4 h-4" />}
-                          </button>
+                          {isMuted ? <VolumeX className="h-4 w-4" /> : <Volume2 className="h-4 w-4" />}
+                        </button>
+                        <div className="relative h-4 w-20 sm:w-28">
+                          <div className="absolute inset-x-0 top-1/2 h-[3px] -translate-y-1/2 rounded-full bg-[#1e3238]" />
+                          <div
+                            className="absolute left-0 top-1/2 h-[3px] -translate-y-1/2 rounded-full bg-gradient-to-r from-[#5ff7e8] to-[#8ce8ff]"
+                            style={{ width: `${isMuted ? 0 : volume}%` }}
+                          />
                           <input
                             type="range"
                             min={0}
@@ -3485,176 +4532,307 @@ export default function SessionPage() {
                             step={1}
                             value={isMuted ? 0 : volume}
                             onChange={(e) => handleVolumeChange(Number(e.target.value))}
-                            className="w-16 accent-[#15c7a8]"
+                            className="broadcast-range absolute inset-0 z-10 w-full"
                             title="Громкость"
                           />
                         </div>
-                        <button
-                          onClick={handlePlayPause}
-                          disabled={!isPlayerReady}
-                          className="ml-auto min-h-10 px-4 rounded-md bg-red-600 hover:bg-red-500 border border-red-300 text-white text-xs sm:text-sm font-black uppercase tracking-wide inline-flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
-                          title={isPlaying ? text.pause : text.play}
-                        >
-                          {isPlaying ? <Pause className="w-4 h-4" /> : <Play className="w-4 h-4 fill-current" />}
-                          <span>{isPlaying ? text.pause : text.play}</span>
-                        </button>
-                        <span className="text-xs text-white/70">
-                          {Math.floor(currentTime)}s / {Math.floor(duration || 0)}s
-                        </span>
                       </div>
 
-                      <input
-                        type="range"
-                        min={0}
-                        max={Math.max(duration, 0)}
-                        step={0.1}
-                        value={clamp(currentTime, 0, Math.max(duration, 0))}
-                        onChange={(e) => handleSeek(Number(e.target.value), true)}
-                        className="w-full accent-[#15c7a8]"
-                      />
+                      </div>
+                      <span className="rounded-full border border-[#2c5a61] bg-[#08141b] px-2.5 py-1 text-[11px] font-black tracking-[0.14em] text-white/70">
+                        {currentTimeLabel} / {durationLabel}
+                      </span>
                     </div>
                   </div>
-                </>
+                </div>
               )}
               {isImmersiveMode && boardOverlay}
+              {timelineEditorModal}
             </div>
             {!isImmersiveMode && boardOverlay}
 
-            <div className={`bg-[#0c1523]/92 border border-[#23314a] rounded-xl px-3 py-2 ${isImmersiveMode ? 'hidden' : ''}`}>
-              <div className="flex flex-wrap items-center gap-2">
-                <button
-                  onClick={() => handleSeek(currentTime - 10, true)}
-                  className="h-10 px-4 rounded-md bg-white/10 hover:bg-white/20 text-sm font-semibold"
+            <div className={`${isImmersiveMode ? 'hidden' : ''} rounded-[24px] border border-[#2d5960]/55 bg-[linear-gradient(180deg,rgba(9,22,29,0.98),rgba(5,12,18,0.94))] px-2.5 py-1.5 shadow-[inset_0_1px_0_rgba(255,255,255,0.03)] sm:px-3 sm:py-2`}>
+              <div className="relative">
+                <div
+                  data-timeline-rail="1"
+                  className="relative h-7 overflow-visible rounded-[16px] border border-[#275754]/55 bg-[linear-gradient(180deg,rgba(7,35,31,0.9),rgba(5,24,23,0.96))]"
+                  onPointerDown={handleTimelineRailPointerDown}
+                  onPointerMove={handleTimelinePointerMove}
+                  onPointerUp={handleTimelinePointerUp}
+                  onPointerCancel={handleTimelinePointerUp}
                 >
-                  -10s
-                </button>
-                <button
-                  onClick={() => handleSeek(currentTime + 10, true)}
-                  className="h-10 px-4 rounded-md bg-white/10 hover:bg-white/20 text-sm font-semibold"
-                >
-                  +10s
-                </button>
-                <button
-                  onClick={handleOpenBoard}
-                  className="h-10 px-4 rounded-md bg-[#1d4ed8] hover:bg-[#2563eb] text-white text-sm font-semibold"
-                >
-                  {text.board}
-                </button>
-
-                <select
-                  value={playbackRate}
-                  onChange={(e) => handlePlaybackRate(Number(e.target.value))}
-                  className="h-10 px-3 rounded-md bg-black/70 border border-white/20 text-sm"
-                >
-                  {PLAYBACK_RATES.map((rate) => (
-                    <option key={`default-rate-${rate}`} value={rate}>
-                      {rate}x
-                    </option>
-                  ))}
-                </select>
-
-                <select
-                  value={qualityPreference}
-                  onChange={(e) => handleQualityChange(e.target.value)}
-                  className="h-10 px-3 rounded-md bg-black/70 border border-white/20 text-sm"
-                  aria-label={text.quality}
-                >
-                  {qualityOptions.map((option) => (
-                    <option key={`default-quality-${option.value}`} value={option.value}>
-                      {option.label}
-                    </option>
-                  ))}
-                </select>
-
-                <div className="flex items-center gap-1">
-                  <button
-                    onClick={handleMuteToggle}
-                    className="h-10 w-10 rounded-md bg-white/10 hover:bg-white/20 inline-flex items-center justify-center flex-shrink-0"
-                    title={isMuted ? 'Включить звук' : 'Выключить звук'}
-                  >
-                    {isMuted ? <VolumeX className="w-4 h-4" /> : <Volume2 className="w-4 h-4" />}
-                  </button>
-                  <input
-                    type="range"
-                    min={0}
-                    max={100}
-                    step={1}
-                    value={isMuted ? 0 : volume}
-                    onChange={(e) => handleVolumeChange(Number(e.target.value))}
-                    className="w-20 accent-[#15c7a8]"
-                    title="Громкость"
+                  <div className="absolute inset-x-2 top-1/2 h-px -translate-y-1/2 bg-[#62f7e8]/20" />
+                  {DECORATIVE_TIMELINE_COLUMNS.map((column) => {
+                    const tone = TIMELINE_TONE_STYLE[column.tone];
+                    const isActive = playbackProgress >= column.position;
+                    return (
+                      <div
+                        key={`timeline-column-${column.position}`}
+                        className="absolute bottom-[3px] w-[2px] rounded-full"
+                        style={{
+                          left: getTimelineAlignedLeft(column.position, -1),
+                          height: `${column.height}px`,
+                          backgroundColor: isActive ? tone.active : tone.inactive,
+                          boxShadow: isActive ? `0 0 10px ${tone.glow}` : 'none',
+                        }}
+                      />
+                    );
+                  })}
+                  {timelineMarkers.map((marker) => {
+                    const markerStyle = TIMELINE_MARKER_STYLE[marker.type];
+                    const leftPercent = safeDuration > 0 ? clamp((marker.time / safeDuration) * 100, 0, 100) : 0;
+                    return (
+                      <button
+                        key={`session-marker-${marker.id}`}
+                        type="button"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          handleTimelineMarkerClick(marker);
+                        }}
+                        onPointerDown={(event) => handleTimelineMarkerPointerDown(event, marker)}
+                        onPointerMove={handleTimelinePointerMove}
+                        onPointerUp={handleTimelinePointerUp}
+                        onPointerCancel={handleTimelinePointerUp}
+                        className="absolute top-[-28px] z-10 h-[50px] w-8 -translate-x-1/2"
+                        style={{ left: getTimelineAlignedLeft(leftPercent) }}
+                        title={`${timelineMarkerTypeLabels[marker.type]} • ${formatSecondsToClock(marker.time)}`}
+                      >
+                        <span className="pointer-events-none absolute inset-0 flex flex-col items-center pb-[2px]">
+                          <span className="drop-shadow-[0_0_10px_rgba(0,0,0,0.48)]">
+                            <TimelineMarkerIcon type={marker.type} color={markerStyle.color} />
+                          </span>
+                          <span
+                            className="mt-[1px] w-[2.5px] flex-1 rounded-full"
+                            style={{
+                              backgroundColor: markerStyle.color,
+                              boxShadow: `0 0 12px ${markerStyle.glow}`,
+                            }}
+                          />
+                        </span>
+                      </button>
+                    );
+                  })}
+                  <div
+                    className="absolute inset-y-[4px] z-[1] w-[2px] rounded-full bg-[#dbffff] shadow-[0_0_18px_rgba(219,255,255,0.78)]"
+                    style={{ left: getTimelineAlignedLeft(playbackProgress, -1) }}
                   />
                 </div>
-
-                <span className="ml-auto text-sm text-white/70">
-                  {Math.floor(currentTime)}s / {Math.floor(duration || 0)}s
-                </span>
-
-                <button
-                  onClick={handlePlayPause}
-                  disabled={!isPlayerReady}
-                  className="h-14 sm:h-16 w-full sm:w-auto sm:min-w-[240px] px-5 sm:px-7 rounded-xl bg-red-600 hover:bg-red-500 border-2 border-red-300 text-white text-lg sm:text-xl font-black uppercase tracking-wide inline-flex items-center justify-center gap-3 shadow-[0_10px_24px_rgba(220,38,38,0.35)] disabled:opacity-50 disabled:cursor-not-allowed"
-                >
-                  {isPlaying ? <Pause className="w-6 h-6" /> : <Play className="w-6 h-6 fill-current" />}
-                  <span>{isPlaying ? text.pause : text.play}</span>
-                </button>
+                {timelineMenuState && (
+                  <div
+                    data-timeline-menu="1"
+                    className="absolute bottom-full z-20 mb-2 -translate-x-1/2"
+                    style={{ left: getTimelineAlignedLeft(timelineMenuState.leftPercent) }}
+                  >
+                    <div className="flex min-w-[170px] flex-col gap-1 rounded-2xl border border-[#2c5a61] bg-[#08141b]/95 p-2 shadow-[0_16px_48px_rgba(0,0,0,0.42)] backdrop-blur-xl">
+                      {TIMELINE_MARKER_TYPES.map((type) => {
+                        const markerStyle = TIMELINE_MARKER_STYLE[type];
+                        return (
+                          <button
+                            key={`menu-${type}`}
+                            type="button"
+                            onClick={() => handleTimelineMenuSelect(type)}
+                            className="rounded-xl border px-3 py-2 text-left text-sm font-black text-white/85 transition-colors hover:bg-white/[0.08]"
+                            style={{ borderColor: markerStyle.color }}
+                          >
+                            {timelineMarkerTypeLabels[type]}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
               </div>
 
-              <input
-                type="range"
-                min={0}
-                max={Math.max(duration, 0)}
-                step={0.1}
-                value={clamp(currentTime, 0, Math.max(duration, 0))}
-                onChange={(e) => handleSeek(Number(e.target.value), true)}
-                className="w-full mt-2 accent-[#15c7a8]"
-              />
+              <div className="relative mt-1.5 h-4">
+                <div className="absolute inset-x-2 top-1/2 h-[2px] -translate-y-1/2 rounded-full bg-[#1a2930]">
+                  <div
+                    className="h-full rounded-full bg-gradient-to-r from-[#5ff7e8] via-[#4bd6ff] to-[#87dfff]"
+                    data-progress-fill="1"
+                    style={{ width: `${playbackProgress}%` }}
+                  />
+                </div>
+                <input
+                  type="range"
+                  min={0}
+                  max={safeDuration}
+                  step={0.1}
+                  value={clampedCurrentTime}
+                  onChange={(e) => handleSeek(Number(e.target.value), true)}
+                  className="broadcast-range absolute inset-0 z-10 w-full"
+                />
+              </div>
+
+              <div className="mt-2 flex flex-wrap items-center justify-between gap-1.5">
+                <div className="flex flex-wrap items-center gap-1.5">
+                <div className="flex items-center gap-1 rounded-full border border-[#2c5a61] bg-[#08141b] p-[3px]">
+                  <button
+                    onClick={() => handleSeek(currentTime - 5, true)}
+                    className="inline-flex h-8 min-w-[54px] items-center justify-center gap-1 rounded-full border border-white/10 bg-white/[0.05] px-2 text-[11px] font-black tracking-[0.08em] text-white transition-colors hover:bg-white/[0.1]"
+                    title="-5s"
+                  >
+                    <ChevronLeft className="h-4 w-4" />
+                    <span>-5s</span>
+                  </button>
+                  <button
+                    onClick={handlePlayPause}
+                    disabled={!isPlayerReady}
+                    className="flex h-8 w-8 items-center justify-center rounded-full border border-[#79ffe9]/40 bg-[#63f6e7]/18 text-[#90fff3] transition-colors hover:bg-[#63f6e7]/24 disabled:cursor-not-allowed disabled:opacity-50"
+                    title={isPlaying ? text.pause : text.play}
+                  >
+                    {isPlaying ? <Pause className="h-4 w-4" /> : <Play className="h-4 w-4 fill-current" />}
+                  </button>
+                  <button
+                    onClick={() => handleSeek(currentTime + 5, true)}
+                    className="inline-flex h-8 min-w-[54px] items-center justify-center gap-1 rounded-full border border-white/10 bg-white/[0.05] px-2 text-[11px] font-black tracking-[0.08em] text-white transition-colors hover:bg-white/[0.1]"
+                    title="+5s"
+                  >
+                    <span>+5s</span>
+                    <ChevronRight className="h-4 w-4" />
+                  </button>
+                </div>
+
+                {renderPlaybackRateControl('broadcast-speed')}
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    setTimelineMenuState(null);
+                    setIsTimelineEditorOpen(true);
+                  }}
+                  className="inline-flex h-9 items-center gap-2 rounded-full border border-[#2c5d63] bg-[#0d1821] px-3 text-[11px] font-black uppercase tracking-[0.14em] text-[#8efdf1] transition-colors hover:bg-[#12212d]"
+                >
+                  <PencilLine className="h-4 w-4" />
+                  {text.timelineMarkersButton}
+                </button>
+
+                {renderQualityControl('broadcast-quality')}
+
+                <div className="flex items-center gap-2 rounded-full border border-[#2c5a61] bg-[#08141b] px-2.5 py-0.5">
+                  <button
+                    onClick={handleMuteToggle}
+                    className="text-white/85 transition-colors hover:text-white"
+                    title={isMuted ? 'Включить звук' : 'Выключить звук'}
+                  >
+                    {isMuted ? <VolumeX className="h-4 w-4" /> : <Volume2 className="h-4 w-4" />}
+                  </button>
+                  <div className="relative h-4 w-20 sm:w-28">
+                    <div className="absolute inset-x-0 top-1/2 h-[3px] -translate-y-1/2 rounded-full bg-[#1e3238]" />
+                    <div
+                      className="absolute left-0 top-1/2 h-[3px] -translate-y-1/2 rounded-full bg-gradient-to-r from-[#5ff7e8] to-[#8ce8ff]"
+                      style={{ width: `${isMuted ? 0 : volume}%` }}
+                    />
+                    <input
+                      type="range"
+                      min={0}
+                      max={100}
+                      step={1}
+                      value={isMuted ? 0 : volume}
+                      onChange={(e) => handleVolumeChange(Number(e.target.value))}
+                      className="broadcast-range absolute inset-0 z-10 w-full"
+                      title="Громкость"
+                    />
+                  </div>
+                </div>
+
+                </div>
+                <span className="rounded-full border border-[#2c5a61] bg-[#08141b] px-2.5 py-1 text-[11px] font-black tracking-[0.14em] text-white/70">
+                  {currentTimeLabel} / {durationLabel}
+                </span>
+              </div>
             </div>
+              </div>
+            </section>
           </div>
 
-          <aside className="bg-white/5 border border-white/10 rounded-xl p-5 space-y-5 h-fit">
-            <h3 className="text-sm lg:text-base font-black uppercase tracking-wide text-premier-cyan">{text.sectionSession}</h3>
-            <section>
-              <h2 className="text-sm font-black uppercase mb-3">{text.joinQr}</h2>
+          <aside className="h-fit space-y-4">
+            <section className="rounded-[28px] border border-[#264c52]/55 bg-[linear-gradient(180deg,rgba(9,21,28,0.96),rgba(5,12,18,0.94))] p-5 shadow-[0_18px_70px_rgba(0,0,0,0.3)]">
+              <h3 className="text-[11px] font-black uppercase tracking-[0.24em] text-[#75efe0]">{text.sectionSession}</h3>
+              <p className="mt-3 text-sm leading-6 text-white/72">{text.coachUiSubtitle}</p>
+            </section>
+
+            <section className="rounded-[28px] border border-[#264c52]/55 bg-[linear-gradient(180deg,rgba(9,21,28,0.96),rgba(5,12,18,0.94))] p-5 shadow-[0_18px_70px_rgba(0,0,0,0.3)]">
+              <h2 className="mb-3 text-[11px] font-black uppercase tracking-[0.24em] text-[#75efe0]">{text.joinQr}</h2>
               {session.qrCode ? (
-                <img src={session.qrCode} alt={text.joinQr} className="w-44 h-44 bg-white p-2 rounded-lg" />
+                <img src={session.qrCode} alt={text.joinQr} className="h-44 w-44 rounded-2xl bg-white p-2" />
               ) : (
                 <p className="text-sm text-white/50">{text.qrNotAvailable}</p>
               )}
-              <div className="mt-2 flex gap-2">
-                <button onClick={() => copyToClipboard(joinUrl)} className="px-4 py-2 rounded bg-white/10 text-sm font-semibold hover:bg-white/20">
+              <div className="mt-4 flex gap-2">
+                <button onClick={() => copyToClipboard(joinUrl)} className="rounded-full border border-white/10 bg-white/[0.05] px-4 py-2 text-xs font-black uppercase tracking-[0.14em] text-white transition-colors hover:bg-white/[0.1]">
                   {text.copyJoinLink}
                 </button>
               </div>
             </section>
 
-            <section>
-              <h2 className="text-sm font-black uppercase mb-2">
+            <section className="rounded-[28px] border border-[#264c52]/55 bg-[linear-gradient(180deg,rgba(9,21,28,0.96),rgba(5,12,18,0.94))] p-5 shadow-[0_18px_70px_rgba(0,0,0,0.3)]">
+              <h2 className="mb-2 text-[11px] font-black uppercase tracking-[0.24em] text-[#75efe0]">
                 {text.participants} ({participants.length})
               </h2>
-              <ul className="space-y-2 max-h-48 overflow-auto pr-1">
+              <p className="text-xs leading-5 text-white/48">{text.participantPencilColorHint}</p>
+              <ul className="mt-4 max-h-56 space-y-2 overflow-auto pr-1">
                 {participants.length === 0 && <li className="text-sm text-white/50">{text.noParticipants}</li>}
                 {participants.map((participant) => (
-                  <li key={`${participant.userId}-${participant.id}`} className="flex items-center gap-2 text-sm">
-                    <span
-                      className="w-3 h-3 rounded-full"
-                      style={{ backgroundColor: participant.color || DEFAULT_COLOR }}
-                    />
-                    <span className="text-white/80">{shortUserId(participant.userId)}</span>
-                    <span className="text-white/40 text-xs uppercase ml-auto">{getRoleLabel(participant.role)}</span>
+                  <li
+                    key={`${participant.userId}-${participant.id}`}
+                    data-participant-color-picker="1"
+                    className="rounded-2xl border border-[#1e3b40] bg-[#08141b] px-3 py-2.5"
+                  >
+                    <div className="flex items-center gap-3 text-sm">
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setActiveParticipantColorUserId((prev) => (prev === participant.userId ? null : participant.userId))
+                        }
+                        className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-full border border-[#2b5c63] bg-[#0c1b22] transition-colors hover:bg-[#122530]"
+                        title={text.participantPencilColor}
+                      >
+                        <span
+                          className="h-4 w-4 rounded-full border border-black/20 shadow-[0_0_12px_rgba(255,255,255,0.12)]"
+                          style={{ backgroundColor: normalizeParticipantColor(participant.color) }}
+                        />
+                      </button>
+                      <div className="min-w-0 flex-1">
+                        <p className="truncate text-white/85">{shortUserId(participant.userId)}</p>
+                        <p className="mt-1 text-[10px] uppercase tracking-[0.16em] text-white/38">{getRoleLabel(participant.role)}</p>
+                      </div>
+                    </div>
+                    {activeParticipantColorUserId === participant.userId && (
+                      <div className="mt-3 rounded-2xl border border-[#22474d] bg-[#0b1820] p-2">
+                        <div className="mb-2 text-[10px] font-black uppercase tracking-[0.16em] text-white/45">
+                          {text.participantPencilColor}
+                        </div>
+                        <div className="grid grid-cols-5 gap-2">
+                          {PARTICIPANT_COLORS.map((color) => {
+                            const isActive = normalizeParticipantColor(participant.color) === color;
+                            return (
+                              <button
+                                key={`${participant.userId}-${color}`}
+                                type="button"
+                                onClick={() => handleParticipantColorChange(participant.userId, color)}
+                                className={`h-8 w-full rounded-full border transition-transform hover:scale-[1.05] ${
+                                  isActive ? 'border-white shadow-[0_0_18px_rgba(255,255,255,0.18)]' : 'border-white/10'
+                                }`}
+                                style={{ backgroundColor: color }}
+                                title={text.participantPencilColor}
+                              />
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
                   </li>
                 ))}
               </ul>
             </section>
 
-            <section>
-              <h2 className="text-sm font-black uppercase mb-2">{text.displayMode}</h2>
-              <p className="text-xs text-white/60 mb-2">{text.displayModeHint}</p>
-              <div className="flex gap-2">
-                <Link href={`/display/${session.id}`} target="_blank" className="btn-primary px-4 py-2 text-sm">
+            <section className="rounded-[28px] border border-[#264c52]/55 bg-[linear-gradient(180deg,rgba(9,21,28,0.96),rgba(5,12,18,0.94))] p-5 shadow-[0_18px_70px_rgba(0,0,0,0.3)]">
+              <h2 className="mb-2 text-[11px] font-black uppercase tracking-[0.24em] text-[#75efe0]">{text.displayMode}</h2>
+              <p className="mt-3 text-sm text-white/64">{text.displayModeHint}</p>
+              <div className="mt-4 flex gap-2">
+                <Link href={`/display/${session.id}`} target="_blank" className="rounded-full border border-[#2c6267] bg-[#0b171d] px-4 py-2 text-xs font-black uppercase tracking-[0.14em] text-[#8cf7ea] transition-colors hover:bg-[#10212a]">
                   {text.openDisplay}
                 </Link>
-                <button onClick={() => copyToClipboard(displayUrl)} className="px-4 py-2 rounded bg-white/10 text-sm font-semibold hover:bg-white/20">
+                <button onClick={() => copyToClipboard(displayUrl)} className="rounded-full border border-white/10 bg-white/[0.05] px-4 py-2 text-xs font-black uppercase tracking-[0.14em] text-white transition-colors hover:bg-white/[0.1]">
                   {text.copyDisplayLink}
                 </button>
               </div>

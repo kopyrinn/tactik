@@ -8,8 +8,14 @@ const DEMO_METRIC_COLUMN_BY_KIND = {
   sessionsCreated: 'sessions_created',
   participantJoins: 'participant_joins',
 } as const;
+const USER_USAGE_METRIC_COLUMN_BY_KIND = {
+  sessionsCreated: 'sessions_created',
+  drawingsCreated: 'drawings_created',
+  boardDrawingsCreated: 'board_drawings_created',
+} as const;
 
 export type DemoMetricKind = keyof typeof DEMO_METRIC_COLUMN_BY_KIND;
+export type UserUsageMetricKind = keyof typeof USER_USAGE_METRIC_COLUMN_BY_KIND;
 
 function syncDemoLoginCounter(database: Database.Database) {
   const row = database.prepare(
@@ -45,6 +51,93 @@ function normalizeSqlParams(sql: string, params: any[]): { sql: string; params: 
     sql: normalizedSql,
     params: indexes.map((i) => params[i]),
   };
+}
+
+function ensureUserUsageMetricColumns(database: Database.Database) {
+  const metricColumns = database
+    .prepare("PRAGMA table_info('user_usage_metrics_daily')")
+    .all() as Array<{ name: string }>;
+
+  if (!metricColumns.some((column) => column.name === 'board_drawings_created')) {
+    database.prepare('ALTER TABLE user_usage_metrics_daily ADD COLUMN board_drawings_created INTEGER NOT NULL DEFAULT 0').run();
+  }
+  if (!metricColumns.some((column) => column.name === 'last_activity_at')) {
+    database.prepare('ALTER TABLE user_usage_metrics_daily ADD COLUMN last_activity_at TEXT').run();
+  }
+}
+
+function incrementUserUsageMetricBackfill(
+  database: Database.Database,
+  userId: string,
+  day: string,
+  kind: UserUsageMetricKind,
+  amount: number,
+  lastActivityAt?: string | null
+) {
+  if (!userId || !day || !Number.isFinite(amount) || amount <= 0) return;
+
+  const column = USER_USAGE_METRIC_COLUMN_BY_KIND[kind];
+  database.prepare(
+    `INSERT INTO user_usage_metrics_daily (user_id, day, last_activity_at)
+     VALUES (?, ?, ?)
+     ON CONFLICT(user_id, day) DO NOTHING`
+  ).run(userId, day, lastActivityAt || null);
+
+  database.prepare(
+    `UPDATE user_usage_metrics_daily
+     SET ${column} = ${column} + ?,
+         last_activity_at = CASE
+           WHEN ? IS NULL THEN last_activity_at
+           WHEN last_activity_at IS NULL OR last_activity_at < ? THEN ?
+           ELSE last_activity_at
+         END
+     WHERE user_id = ? AND day = ?`
+  ).run(amount, lastActivityAt || null, lastActivityAt || null, lastActivityAt || null, userId, day);
+}
+
+function backfillUserUsageMetrics(database: Database.Database) {
+  const metricsRow = database.prepare(
+    'SELECT COUNT(*) AS cnt FROM user_usage_metrics_daily'
+  ).get() as { cnt: number | string } | undefined;
+  const metricsCount = Number(metricsRow?.cnt || 0);
+  if (metricsCount > 0) return;
+
+  const sessionRows = database.prepare(
+    `SELECT owner_id AS user_id, SUBSTR(created_at, 1, 10) AS day, MAX(created_at) AS last_activity_at, COUNT(*) AS cnt
+     FROM sessions
+     WHERE is_demo = 0
+     GROUP BY owner_id, SUBSTR(created_at, 1, 10)`
+  ).all() as Array<{ user_id: string; day: string; last_activity_at: string | null; cnt: number | string }>;
+
+  for (const row of sessionRows) {
+    incrementUserUsageMetricBackfill(
+      database,
+      row.user_id,
+      row.day,
+      'sessionsCreated',
+      Number(row.cnt || 0),
+      row.last_activity_at
+    );
+  }
+
+  const drawingRows = database.prepare(
+    `SELECT s.owner_id AS user_id, SUBSTR(d.created_at, 1, 10) AS day, MAX(d.created_at) AS last_activity_at, COUNT(*) AS cnt
+     FROM drawings d
+     INNER JOIN sessions s ON s.id = d.session_id
+     WHERE COALESCE(s.is_demo, 0) = 0
+     GROUP BY s.owner_id, SUBSTR(d.created_at, 1, 10)`
+  ).all() as Array<{ user_id: string; day: string; last_activity_at: string | null; cnt: number | string }>;
+
+  for (const row of drawingRows) {
+    incrementUserUsageMetricBackfill(
+      database,
+      row.user_id,
+      row.day,
+      'drawingsCreated',
+      Number(row.cnt || 0),
+      row.last_activity_at
+    );
+  }
 }
 
 // Generate UUID for SQLite
@@ -134,10 +227,21 @@ export async function initDatabase() {
       participant_joins INTEGER NOT NULL DEFAULT 0
     );
 
+    CREATE TABLE IF NOT EXISTS user_usage_metrics_daily (
+      user_id TEXT NOT NULL,
+      day TEXT NOT NULL,
+      sessions_created INTEGER NOT NULL DEFAULT 0,
+      drawings_created INTEGER NOT NULL DEFAULT 0,
+      board_drawings_created INTEGER NOT NULL DEFAULT 0,
+      last_activity_at TEXT,
+      PRIMARY KEY (user_id, day)
+    );
+
     CREATE INDEX IF NOT EXISTS idx_sessions_owner ON sessions(owner_id);
     CREATE INDEX IF NOT EXISTS idx_sessions_active ON sessions(is_active);
     CREATE INDEX IF NOT EXISTS idx_participants_session ON session_participants(session_id);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_participants_session_user ON session_participants(session_id, user_id);
+    CREATE INDEX IF NOT EXISTS idx_user_usage_metrics_user_day ON user_usage_metrics_daily(user_id, day DESC);
   `;
 
   db.exec(schema);
@@ -206,6 +310,20 @@ export async function initDatabase() {
       participant_joins INTEGER NOT NULL DEFAULT 0
     )`
   ).run();
+  db.prepare(
+    `CREATE TABLE IF NOT EXISTS user_usage_metrics_daily (
+      user_id TEXT NOT NULL,
+      day TEXT NOT NULL,
+      sessions_created INTEGER NOT NULL DEFAULT 0,
+      drawings_created INTEGER NOT NULL DEFAULT 0,
+      board_drawings_created INTEGER NOT NULL DEFAULT 0,
+      last_activity_at TEXT,
+      PRIMARY KEY (user_id, day)
+    )`
+  ).run();
+  ensureUserUsageMetricColumns(db);
+  db.prepare('CREATE INDEX IF NOT EXISTS idx_user_usage_metrics_user_day ON user_usage_metrics_daily(user_id, day DESC)').run();
+  backfillUserUsageMetrics(db);
   syncDemoLoginCounter(db);
 
   console.log('SQLite database initialized at:', dbPath);
@@ -293,5 +411,51 @@ export function incrementDemoMetric(kind: DemoMetricKind, amount = 1, at = new D
     db.prepare(`UPDATE demo_metrics_daily SET ${column} = ${column} + ? WHERE day = ?`).run(amount, day);
   } catch (error) {
     console.error('incrementDemoMetric error:', error);
+  }
+}
+
+export function incrementUserUsageMetric(userId: string, kind: UserUsageMetricKind, amount = 1, at = new Date()) {
+  if (!userId || !Number.isFinite(amount) || amount <= 0) return;
+
+  try {
+    const day = at.toISOString().slice(0, 10);
+    const timestamp = at.toISOString();
+    const column = USER_USAGE_METRIC_COLUMN_BY_KIND[kind];
+    const db = getDb();
+
+    db.prepare('INSERT OR IGNORE INTO user_usage_metrics_daily (user_id, day, last_activity_at) VALUES (?, ?, ?)').run(userId, day, timestamp);
+    db.prepare(
+      `UPDATE user_usage_metrics_daily
+       SET ${column} = ${column} + ?,
+           last_activity_at = CASE
+             WHEN last_activity_at IS NULL OR last_activity_at < ? THEN ?
+             ELSE last_activity_at
+           END
+       WHERE user_id = ? AND day = ?`
+    ).run(amount, timestamp, timestamp, userId, day);
+  } catch (error) {
+    console.error('incrementUserUsageMetric error:', error);
+  }
+}
+
+export function touchUserUsageActivity(userId: string, at = new Date()) {
+  if (!userId) return;
+
+  try {
+    const day = at.toISOString().slice(0, 10);
+    const timestamp = at.toISOString();
+    const db = getDb();
+
+    db.prepare('INSERT OR IGNORE INTO user_usage_metrics_daily (user_id, day, last_activity_at) VALUES (?, ?, ?)').run(userId, day, timestamp);
+    db.prepare(
+      `UPDATE user_usage_metrics_daily
+       SET last_activity_at = CASE
+         WHEN last_activity_at IS NULL OR last_activity_at < ? THEN ?
+         ELSE last_activity_at
+       END
+       WHERE user_id = ? AND day = ?`
+    ).run(timestamp, timestamp, userId, day);
+  } catch (error) {
+    console.error('touchUserUsageActivity error:', error);
   }
 }
