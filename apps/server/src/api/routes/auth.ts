@@ -8,9 +8,12 @@ import {
   getUserFromSession,
   addUserActiveSession,
   countUserActiveSessions,
+  refreshUserActiveSession,
+  removeUserActiveSession,
 } from '../../redis';
 import { JWT_SECRET } from '../../config';
 import { getAuthTokenFromRequest, revokeAuthTokenSession } from '../../utils/authSession';
+import { authMiddleware } from '../middleware/auth';
 import type { User, ApiResponse } from '../../types';
 
 const router = Router();
@@ -230,6 +233,33 @@ router.post('/logout', async (req, res) => {
   }
 });
 
+router.post('/presence', authMiddleware, async (req, res) => {
+  try {
+    const token = getAuthTokenFromRequest(req);
+    const userId = req.userId;
+
+    if (!token || !userId) {
+      return res.status(401).json({ success: false, error: 'Not authenticated' } as ApiResponse);
+    }
+
+    const shouldMarkActive = req.body?.active !== false;
+
+    if (shouldMarkActive) {
+      await refreshUserActiveSession(userId, token);
+    } else {
+      await removeUserActiveSession(userId, token);
+    }
+
+    res.json({
+      success: true,
+      data: { active: shouldMarkActive },
+    } as ApiResponse<{ active: boolean }>);
+  } catch (error) {
+    console.error('Presence update error:', error);
+    res.status(500).json({ success: false, error: 'Failed to update presence' } as ApiResponse);
+  }
+});
+
 // Get current user
 router.get('/me', async (req, res) => {
   try {
@@ -246,6 +276,8 @@ router.get('/me', async (req, res) => {
     if (!sessionUserId || sessionUserId !== decoded.userId) {
       return res.status(401).json({ success: false, error: 'Session expired' } as ApiResponse);
     }
+
+    await refreshUserActiveSession(decoded.userId, token);
 
     const user = await queryOne<any>(
       `SELECT id, email, name, avatar_url, plan, coach_owner_id, subscription_status,

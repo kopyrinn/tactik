@@ -11,11 +11,12 @@ import { setDemoAuthMarker } from '@/lib/constants/demo';
 import { useAuthStore } from '@/lib/stores/authStore';
 import { useUiStore } from '@/lib/stores/uiStore';
 import { useInactivityLogout } from '@/lib/hooks/useInactivityLogout';
+import { useAuthPresence } from '@/lib/hooks/useAuthPresence';
 import type { BoardPieceLabels, BoardState, Session } from '@/lib/types';
 
 type DrawTool = 'freehand' | 'arrow' | 'circle' | 'line' | 'text';
 type TimelineTone = 'cyan' | 'gold' | 'red';
-type TimelineMarkerType = 'goal' | 'dismissal' | 'substitution' | 'foul' | 'freeKick';
+type TimelineMarkerType = 'goal' | 'dismissal' | 'substitution' | 'foul' | 'freeKick' | 'moment';
 
 type TimelineMarker = {
   id: string;
@@ -97,6 +98,7 @@ type SessionStatePayload = {
   videoState?: VideoSyncState;
   boardState?: BoardState | null;
   boardOpen?: boolean;
+  timelineMarkers?: TimelineMarker[];
 };
 
 type BoardTeam = 'red' | 'yellow' | 'ball';
@@ -159,6 +161,8 @@ const QUALITY_LABELS: Record<string, string> = {
   small: '240p',
   tiny: '144p',
 };
+// Per the official YouTube IFrame API docs, manual playback-quality forcing is a no-op.
+const YOUTUBE_IFRAME_MANUAL_QUALITY_CONTROL_SUPPORTED = false;
 const DEMO_FALLBACK_DURATION_MS = 5 * 60 * 1000;
 const YOUTUBE_RELATED_CLOSE_ZONE = {
   minX: 0.962,
@@ -170,7 +174,11 @@ const YOUTUBE_RELATED_PASSTHROUGH_MS = 900;
 const COMPACT_TOUCH_MAX_SHORT_SIDE_PX = 699;
 const TIMELINE_MARKER_HOLD_MS = 600;
 const TIMELINE_TRACK_INSET_PX = 8;
-const TIMELINE_MARKER_TYPES: TimelineMarkerType[] = ['goal', 'dismissal', 'substitution', 'foul', 'freeKick'];
+const DESKTOP_PLAYBACK_UI_POLL_INTERVAL_MS = 250;
+const TOUCH_PLAYBACK_UI_POLL_INTERVAL_MS = 500;
+const DESKTOP_PLAYBACK_UI_UPDATE_STEP_SECONDS = 0.08;
+const TOUCH_PLAYBACK_UI_UPDATE_STEP_SECONDS = 0.45;
+const TIMELINE_MARKER_TYPES: TimelineMarkerType[] = ['goal', 'dismissal', 'substitution', 'foul', 'freeKick', 'moment'];
 const getTimelineAlignedLeft = (percent: number, offsetPx = 0) => {
   const fraction = clamp(percent, 0, 100) / 100;
   const offset =
@@ -233,6 +241,10 @@ const TIMELINE_MARKER_STYLE: Record<TimelineMarkerType, { color: string; glow: s
   freeKick: {
     color: '#6e88ff',
     glow: 'rgba(110,136,255,0.5)',
+  },
+  moment: {
+    color: '#b07cff',
+    glow: 'rgba(176,124,255,0.5)',
   },
 };
 
@@ -356,6 +368,21 @@ function TimelineMarkerIcon({ type, color }: { type: TimelineMarkerType; color: 
         <path d="M15.32 10.35 15.96 9.68l1.1 0.27 0.34 1.13-0.55 0.9-1.32-0.25-0.22-1.38Z" fill="#3f74d7" />
         <path d="M12.82 13.02h2.84l0.4 1.02-0.88 0.88h-1.86l-0.9-0.88 0.4-1.02Z" fill="#3f74d7" />
         <circle cx="18.75" cy="7.15" r="0.34" fill="#9f2d27" />
+      </svg>
+    );
+  }
+  if (type === 'moment') {
+    return (
+      <svg width="24" height="24" viewBox="0 0 20 20" fill="none" className="pointer-events-none">
+        <circle cx="10" cy="10" r="7.7" fill="#150d22" stroke={color} strokeWidth="1.2" />
+        <circle cx="10" cy="10" r="4.65" fill="#2d1a49" stroke="#eedfff" strokeWidth="0.9" opacity="0.95" />
+        <path
+          d="M10 5.55 11.22 8.02l2.73 0.4-1.98 1.93 0.46 2.73L10 11.8l-2.43 1.28 0.46-2.73-1.98-1.93 2.73-0.4L10 5.55Z"
+          fill="#f4ecff"
+          stroke="#5f33ad"
+          strokeWidth="0.7"
+          strokeLinejoin="round"
+        />
       </svg>
     );
   }
@@ -564,6 +591,7 @@ type SessionLocaleText = {
   quality: string;
   qualityAuto: string;
   qualityMax: string;
+  qualityManagedByYoutube: string;
   coachUiTitle: string;
   coachUiSubtitle: string;
   sectionVideo: string;
@@ -590,6 +618,7 @@ type SessionLocaleText = {
   timelineSubstitution: string;
   timelineFoul: string;
   timelineFreeKick: string;
+  timelineMoment: string;
   timelineMarkersButton: string;
   timelineEditorTitle: string;
   timelineEditorEmpty: string;
@@ -658,6 +687,7 @@ const SESSION_TEXT: Record<'ru' | 'kk', SessionLocaleText> = {
     quality: 'Качество',
     qualityAuto: 'Авто',
     qualityMax: 'Максимум',
+    qualityManagedByYoutube: 'YouTube сам подбирает качество для встроенного плеера',
     coachUiTitle: 'Понятная панель тренера',
     coachUiSubtitle: 'Шаг 1: управляйте видео. Шаг 2: выберите инструмент и рисуйте. Шаг 3: делитесь с участниками.',
     sectionVideo: '1. Видео',
@@ -684,6 +714,7 @@ const SESSION_TEXT: Record<'ru' | 'kk', SessionLocaleText> = {
     timelineSubstitution: 'Замена',
     timelineFoul: 'Нарушение',
     timelineFreeKick: 'Штрафной удар',
+    timelineMoment: 'Момент',
     timelineMarkersButton: 'Метки',
     timelineEditorTitle: 'Редактор меток',
     timelineEditorEmpty: 'Пока нет добавленных меток.',
@@ -750,6 +781,7 @@ const SESSION_TEXT: Record<'ru' | 'kk', SessionLocaleText> = {
     quality: 'Сапа',
     qualityAuto: 'Авто',
     qualityMax: 'Максимум',
+    qualityManagedByYoutube: 'Ендірілген ойнатқыштағы сапаны YouTube өзі таңдайды',
     coachUiTitle: 'Жаттықтырушыға ыңғайлы панель',
     coachUiSubtitle: '1-қадам: видеоны басқарыңыз. 2-қадам: құралды таңдап, сызыңыз. 3-қадам: қатысушылармен бөлісіңіз.',
     sectionVideo: '1. Видео',
@@ -776,6 +808,7 @@ const SESSION_TEXT: Record<'ru' | 'kk', SessionLocaleText> = {
     timelineSubstitution: 'Ауыстыру',
     timelineFoul: 'Ереже бұзу',
     timelineFreeKick: 'Айып соққысы',
+    timelineMoment: 'Сәт',
     timelineMarkersButton: 'Белгілер',
     timelineEditorTitle: 'Белгі редакторы',
     timelineEditorEmpty: 'Әзірге белгі қосылмаған.',
@@ -908,6 +941,7 @@ function normalizeTimelineMarkers(value: unknown): TimelineMarker[] {
       id: typeof item.id === 'string' ? item.id : createId(),
       time: Number.isFinite(item.time) ? Math.max(0, Number(item.time)) : 0,
       type: item.type === 'goal' || item.type === 'dismissal' || item.type === 'substitution' || item.type === 'foul'
+        || item.type === 'freeKick' || item.type === 'moment'
         ? item.type
         : 'foul',
     }))
@@ -1051,6 +1085,7 @@ export default function SessionPage() {
   const { language } = useUiStore();
 
   useInactivityLogout();
+  useAuthPresence();
 
   const sessionId = params?.id;
   const isDisplayMode = searchParams.get('display') === '1';
@@ -1088,11 +1123,14 @@ export default function SessionPage() {
   const [volume, setVolume] = useState(100);
   const [videoError, setVideoError] = useState<string | null>(null);
   const [isPlayerReady, setIsPlayerReady] = useState(false);
+  const [reportedQuality, setReportedQuality] = useState<string | null>(null);
   const [isYoutubeClosePassThrough, setIsYoutubeClosePassThrough] = useState(false);
   const [isYoutubeClosePassThroughArmed, setIsYoutubeClosePassThroughArmed] = useState(true);
   const [youtubeHost, setYoutubeHost] = useState<'https://www.youtube-nocookie.com' | 'https://www.youtube.com'>('https://www.youtube-nocookie.com');
   const [availableQualities, setAvailableQualities] = useState<string[]>([]);
-  const [qualityPreference, setQualityPreference] = useState<string>('max');
+  const [qualityPreference, setQualityPreference] = useState<string>(
+    YOUTUBE_IFRAME_MANUAL_QUALITY_CONTROL_SUPPORTED ? 'max' : 'auto'
+  );
   const [isCanvasEnabled, setIsCanvasEnabled] = useState(true);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [isPseudoFullscreen, setIsPseudoFullscreen] = useState(false);
@@ -1133,6 +1171,7 @@ export default function SessionPage() {
   const boardOverlayScrollRef = useRef<HTMLDivElement | null>(null);
   const socketRef = useRef<Socket | null>(null);
   const playerRef = useRef<any>(null);
+  const timelineMarkersRef = useRef<TimelineMarker[]>([]);
   const currentDraftRef = useRef<SessionDrawing | null>(null);
   const boardDragRef = useRef<{ pieceId: string; pointerId: number; offsetX: number; offsetY: number } | null>(null);
   const boardGroupDragRef = useRef<{
@@ -1223,6 +1262,27 @@ export default function SessionPage() {
     ],
     [availableQualities, text.qualityAuto, text.qualityMax]
   );
+  const qualityButtonValueLabel = useMemo(() => {
+    if (!YOUTUBE_IFRAME_MANUAL_QUALITY_CONTROL_SUPPORTED) {
+      return reportedQuality && QUALITY_LABELS[reportedQuality]
+        ? `${text.qualityAuto} ${QUALITY_LABELS[reportedQuality]}`
+        : text.qualityAuto;
+    }
+
+    if (qualityPreference === 'auto') {
+      return reportedQuality && QUALITY_LABELS[reportedQuality]
+        ? `${text.qualityAuto} ${QUALITY_LABELS[reportedQuality]}`
+        : text.qualityAuto;
+    }
+
+    if (qualityPreference === 'max') {
+      return reportedQuality && QUALITY_LABELS[reportedQuality]
+        ? QUALITY_LABELS[reportedQuality]
+        : text.qualityMax;
+    }
+
+    return QUALITY_LABELS[qualityPreference] || qualityPreference;
+  }, [qualityPreference, reportedQuality, text.qualityAuto, text.qualityMax]);
   const safeDuration = Number.isFinite(duration) ? Math.max(duration, 0) : 0;
   const clampedCurrentTime = safeDuration > 0 ? clamp(currentTime, 0, safeDuration) : 0;
   const playbackProgress = safeDuration > 0 ? (clampedCurrentTime / safeDuration) * 100 : 0;
@@ -1239,9 +1299,20 @@ export default function SessionPage() {
       substitution: text.timelineSubstitution,
       foul: text.timelineFoul,
       freeKick: text.timelineFreeKick,
+      moment: text.timelineMoment,
     }),
-    [text.timelineDismissal, text.timelineFoul, text.timelineFreeKick, text.timelineGoal, text.timelineSubstitution]
+    [text.timelineDismissal, text.timelineFoul, text.timelineFreeKick, text.timelineGoal, text.timelineMoment, text.timelineSubstitution]
   );
+  const visibleTimelineColumns = useMemo(
+    () => (isTouchLayout ? DECORATIVE_TIMELINE_COLUMNS.filter((_, index) => index % 2 === 0) : DECORATIVE_TIMELINE_COLUMNS),
+    [isTouchLayout]
+  );
+  const applyTimelineMarkersState = useCallback((nextMarkers: unknown) => {
+    const normalized = normalizeTimelineMarkers(nextMarkers);
+    timelineMarkersRef.current = normalized;
+    setTimelineMarkers(normalized);
+    return normalized;
+  }, []);
   const youtubePlayerOpts = useMemo(() => {
     const playerVars: Record<string, string | number> = {
       controls: 0,
@@ -1268,7 +1339,7 @@ export default function SessionPage() {
 
   useEffect(() => {
     if (typeof window === 'undefined' || !timelineStorageKey) {
-      setTimelineMarkers([]);
+      applyTimelineMarkersState([]);
       setIsTimelineMarkersReady(false);
       return;
     }
@@ -1276,12 +1347,12 @@ export default function SessionPage() {
     setIsTimelineMarkersReady(false);
     try {
       const raw = window.localStorage.getItem(timelineStorageKey);
-      setTimelineMarkers(raw ? normalizeTimelineMarkers(JSON.parse(raw)) : []);
+      applyTimelineMarkersState(raw ? JSON.parse(raw) : []);
     } catch {
-      setTimelineMarkers([]);
+      applyTimelineMarkersState([]);
     }
     setIsTimelineMarkersReady(true);
-  }, [timelineStorageKey]);
+  }, [applyTimelineMarkersState, timelineStorageKey]);
 
   useEffect(() => {
     if (typeof window === 'undefined' || !timelineStorageKey || !isTimelineMarkersReady) return;
@@ -2190,6 +2261,8 @@ export default function SessionPage() {
 
   const applyQualityPreference = useCallback(
     (preference: string, playerInput?: any) => {
+      if (!YOUTUBE_IFRAME_MANUAL_QUALITY_CONTROL_SUPPORTED) return;
+
       const player = playerInput || playerRef.current;
       if (!player?.setPlaybackQuality) return;
 
@@ -2212,11 +2285,23 @@ export default function SessionPage() {
 
   const handleQualityChange = useCallback(
     (nextPreference: string) => {
+      if (!YOUTUBE_IFRAME_MANUAL_QUALITY_CONTROL_SUPPORTED) return;
       setQualityPreference(nextPreference);
       applyQualityPreference(nextPreference);
     },
     [applyQualityPreference]
   );
+
+  const handlePlaybackQualityChange = useCallback((event: YouTubeEvent<string>) => {
+    const nextQuality = typeof event?.data === 'string' ? event.data : '';
+    if (!nextQuality) return;
+
+    setReportedQuality((prev) => (prev === nextQuality ? prev : nextQuality));
+
+    if (QUALITY_PRIORITY.includes(nextQuality)) {
+      setAvailableQualities((prev) => normalizeQualityLevels([...prev, nextQuality]));
+    }
+  }, []);
 
   const applyVideoSync = useCallback((state: VideoSyncState) => {
     const player = playerRef.current;
@@ -2285,6 +2370,28 @@ export default function SessionPage() {
     [duration, emitVideo]
   );
 
+  const emitTimelineState = useCallback(
+    (nextMarkers: TimelineMarker[]) => {
+      if (!sessionId) return;
+      socketRef.current?.emit('timeline:state', {
+        sessionId,
+        timelineMarkers: nextMarkers,
+      });
+    },
+    [sessionId]
+  );
+
+  const updateTimelineMarkers = useCallback(
+    (updater: TimelineMarker[] | ((prev: TimelineMarker[]) => TimelineMarker[])) => {
+      const previousMarkers = timelineMarkersRef.current;
+      const rawNext = typeof updater === 'function' ? updater(previousMarkers) : updater;
+      const resolvedNext = applyTimelineMarkersState(rawNext);
+
+      emitTimelineState(resolvedNext);
+    },
+    [applyTimelineMarkersState, emitTimelineState]
+  );
+
   const cancelTimelineHold = useCallback(() => {
     if (timelineHoldTimerRef.current) {
       window.clearTimeout(timelineHoldTimerRef.current);
@@ -2331,18 +2438,15 @@ export default function SessionPage() {
       if (safeDuration <= 0) return;
       if (event.pointerType === 'mouse' && event.button !== 0) return;
 
-      const rect = event.currentTarget.getBoundingClientRect();
-      if (rect.width <= 0) return;
-
-      const leftPercent = getTimelineAlignedPercent(event.clientX, rect);
-      const markerTime = (leftPercent / 100) * safeDuration;
       beginTimelineHold(event, {
-        time: markerTime,
-        leftPercent,
+        // Adding a marker at the current playhead is much easier on touch devices
+        // than trying to hit an exact point on the timeline with a finger.
+        time: clampedCurrentTime,
+        leftPercent: playbackProgress,
         markerId: null,
       });
     },
-    [beginTimelineHold, safeDuration]
+    [beginTimelineHold, clampedCurrentTime, playbackProgress, safeDuration]
   );
 
   const handleTimelineMarkerPointerDown = useCallback(
@@ -2398,7 +2502,7 @@ export default function SessionPage() {
     (type: TimelineMarkerType) => {
       if (!timelineMenuState) return;
 
-      setTimelineMarkers((prev) => {
+      updateTimelineMarkers((prev) => {
         const next = timelineMenuState.markerId
           ? prev.map((marker) =>
               marker.id === timelineMenuState.markerId
@@ -2423,18 +2527,24 @@ export default function SessionPage() {
 
       setTimelineMenuState(null);
     },
-    [timelineMenuState]
+    [timelineMenuState, updateTimelineMarkers]
   );
 
   const handleTimelineMarkerDelete = useCallback((markerId: string) => {
-    setTimelineMarkers((prev) => prev.filter((marker) => marker.id !== markerId));
+    updateTimelineMarkers((prev) => prev.filter((marker) => marker.id !== markerId));
     setTimelineMenuState((prev) => (prev?.markerId === markerId ? null : prev));
-  }, []);
+  }, [updateTimelineMarkers]);
 
   const handleTimelineDeleteAll = useCallback(() => {
-    setTimelineMarkers([]);
+    updateTimelineMarkers([]);
     setTimelineMenuState(null);
-  }, []);
+  }, [updateTimelineMarkers]);
+
+  const handleTimelineEditorJump = useCallback((marker: TimelineMarker) => {
+    handleSeek(marker.time, true);
+    setTimelineMenuState(null);
+    setIsTimelineEditorOpen(false);
+  }, [handleSeek]);
 
   useEffect(() => {
     return () => {
@@ -2576,6 +2686,7 @@ export default function SessionPage() {
       playerRef.current = event.target;
       setIsPlayerReady(true);
       setVideoError(null);
+      setReportedQuality(null);
       setDuration(Number(event.target.getDuration?.() || 0));
       syncQualityLevels(event.target);
       applyQualityPreference(qualityPreference, event.target);
@@ -3308,6 +3419,7 @@ export default function SessionPage() {
     socket.on('session:state', (state: SessionStatePayload) => {
       setParticipants(dedupeParticipants(state.participants || []));
       setDrawings(state.drawings || []);
+      applyTimelineMarkersState(state.timelineMarkers || []);
       setRemoteDrafts({});
       setRedoStack([]);
       if (state.boardState) {
@@ -3345,6 +3457,10 @@ export default function SessionPage() {
 
     socket.on('board:state', (state: BoardState | null | undefined) => {
       applyIncomingBoardState(state);
+    });
+
+    socket.on('timeline:state', (markers: TimelineMarker[] | undefined) => {
+      applyTimelineMarkersState(markers || []);
     });
 
     socket.on('board:labels', (labels: BoardPieceLabels | null | undefined) => {
@@ -3397,9 +3513,14 @@ export default function SessionPage() {
       socket.disconnect();
       socketRef.current = null;
     };
-  }, [applyBoardVisibility, applyIncomingBoardState, applyVideoSync, isDisplayMode, isDemoMode, demoGuestId, sessionId, socketUrl, userIdForSocket]);
+  }, [applyBoardVisibility, applyIncomingBoardState, applyTimelineMarkersState, applyVideoSync, isDisplayMode, isDemoMode, demoGuestId, sessionId, socketUrl, userIdForSocket]);
 
   useEffect(() => {
+    const pollIntervalMs = isTouchLayout ? TOUCH_PLAYBACK_UI_POLL_INTERVAL_MS : DESKTOP_PLAYBACK_UI_POLL_INTERVAL_MS;
+    const playbackUiUpdateStepSeconds = isTouchLayout
+      ? TOUCH_PLAYBACK_UI_UPDATE_STEP_SECONDS
+      : DESKTOP_PLAYBACK_UI_UPDATE_STEP_SECONDS;
+
     const timer = window.setInterval(() => {
       const player = playerRef.current;
       if (!player) return;
@@ -3412,21 +3533,34 @@ export default function SessionPage() {
         return;
       }
 
-      if (!Number.isNaN(t)) setCurrentTime(t);
-      if (!Number.isNaN(d) && d > 0) setDuration(d);
-    }, 250);
+      if (!Number.isNaN(t)) {
+        setCurrentTime((prev) => {
+          if (!Number.isFinite(prev)) return t;
+          const threshold = isPlaying ? playbackUiUpdateStepSeconds : 0.05;
+          return Math.abs(prev - t) >= threshold ? t : prev;
+        });
+      }
+
+      if (!Number.isNaN(d) && d > 0) {
+        setDuration((prev) => (Math.abs(prev - d) >= 0.5 ? d : prev));
+      }
+    }, pollIntervalMs);
 
     return () => window.clearInterval(timer);
-  }, [handleVideoEnd, isPlaying]);
+  }, [handleVideoEnd, isPlaying, isTouchLayout]);
 
   useEffect(() => {
+    if (!YOUTUBE_IFRAME_MANUAL_QUALITY_CONTROL_SUPPORTED) {
+      return;
+    }
+
     const timer = window.setInterval(() => {
       const player = playerRef.current;
       if (!player) return;
 
-      const levels = syncQualityLevels(player);
-      if (qualityPreference === 'max' && levels.length > 0) {
-        applyQualityPreference('max', player);
+      syncQualityLevels(player);
+      if (qualityPreference !== 'auto') {
+        applyQualityPreference(qualityPreference, player);
       }
     }, 2000);
 
@@ -3434,11 +3568,12 @@ export default function SessionPage() {
   }, [applyQualityPreference, qualityPreference, syncQualityLevels]);
 
   useEffect(() => {
-    setQualityPreference('max');
+    setQualityPreference(YOUTUBE_IFRAME_MANUAL_QUALITY_CONTROL_SUPPORTED ? 'max' : 'auto');
     setIsQualityMenuOpen(false);
+    setReportedQuality(null);
 
     const player = playerRef.current;
-    if (player) {
+    if (player && YOUTUBE_IFRAME_MANUAL_QUALITY_CONTROL_SUPPORTED) {
       applyQualityPreference('max', player);
     }
   }, [applyQualityPreference, session?.youtubeVideoId, sessionId]);
@@ -3466,10 +3601,49 @@ export default function SessionPage() {
     </div>
   );
 
-  const renderQualityControl = (keyPrefix: string) => (
+  const renderBoardControl = () => (
+    <button
+      type="button"
+      onClick={() => {
+        setTimelineMenuState(null);
+        if (isBoardOpen) {
+          void handleCloseBoard();
+          return;
+        }
+        handleOpenBoard();
+      }}
+      className={`inline-flex h-9 items-center gap-2 rounded-full border px-3 text-[11px] font-black uppercase tracking-[0.14em] transition-colors ${
+        isBoardOpen
+          ? 'border-[#7df8ea]/45 bg-[#63f6e7]/16 text-[#9ffff4] hover:bg-[#63f6e7]/24'
+          : 'border-[#2c5d63] bg-[#0d1821] text-[#8efdf1] hover:bg-[#12212d]'
+      }`}
+    >
+      <span>{isBoardOpen ? text.closeBoard : text.board}</span>
+    </button>
+  );
+
+  const renderQualityControl = (
+    keyPrefix: string,
+    options?: {
+      buttonClassName?: string;
+      menuAlign?: 'left' | 'right';
+      menuVertical?: 'up' | 'down';
+      showValueLabel?: boolean;
+    }
+  ) => {
+    const showQualityMenu = YOUTUBE_IFRAME_MANUAL_QUALITY_CONTROL_SUPPORTED && isQualityMenuOpen;
+    const showValueLabel = options?.showValueLabel || !YOUTUBE_IFRAME_MANUAL_QUALITY_CONTROL_SUPPORTED;
+
+    return (
     <div className="relative" data-quality-menu="1">
-      {isQualityMenuOpen && (
-        <div className="absolute bottom-full left-0 z-30 mb-2 min-w-[170px] rounded-[18px] border border-[#2c5d63] bg-[linear-gradient(180deg,rgba(13,24,33,0.98),rgba(7,18,24,0.98))] p-2 shadow-[0_22px_50px_rgba(0,0,0,0.46)] backdrop-blur-xl">
+      {showQualityMenu && (
+        <div
+          className={`absolute z-30 min-w-[170px] rounded-[18px] border border-[#2c5d63] bg-[linear-gradient(180deg,rgba(13,24,33,0.98),rgba(7,18,24,0.98))] p-2 shadow-[0_22px_50px_rgba(0,0,0,0.46)] backdrop-blur-xl ${
+            options?.menuVertical === 'down' ? 'top-full mt-2' : 'bottom-full mb-2'
+          } ${
+            options?.menuAlign === 'right' ? 'right-0' : 'left-0'
+          }`}
+        >
           <div className="flex flex-col gap-1">
             {qualityOptions.map((option) => {
               const isActive = qualityPreference === option.value;
@@ -3498,14 +3672,26 @@ export default function SessionPage() {
 
       <button
         type="button"
-        onClick={() => setIsQualityMenuOpen((prev) => !prev)}
-        className="inline-flex h-9 items-center gap-2 rounded-full border border-[#2c5d63] bg-[#0d1821] px-3 text-[11px] font-black uppercase tracking-[0.14em] text-[#8efdf1] transition-colors hover:bg-[#12212d]"
+        onClick={() => {
+          if (!YOUTUBE_IFRAME_MANUAL_QUALITY_CONTROL_SUPPORTED) return;
+          setIsQualityMenuOpen((prev) => !prev);
+        }}
+        title={YOUTUBE_IFRAME_MANUAL_QUALITY_CONTROL_SUPPORTED ? undefined : text.qualityManagedByYoutube}
+        className={options?.buttonClassName || `inline-flex h-9 items-center gap-2 rounded-full border border-[#2c5d63] bg-[#0d1821] px-3 text-[11px] font-black uppercase tracking-[0.14em] text-[#8efdf1] transition-colors ${
+          YOUTUBE_IFRAME_MANUAL_QUALITY_CONTROL_SUPPORTED ? 'hover:bg-[#12212d]' : 'cursor-default'
+        }`}
       >
-        {text.quality}
-        <ChevronDown className={`h-4 w-4 transition-transform ${isQualityMenuOpen ? 'rotate-180' : ''}`} />
+        <span>{text.quality}</span>
+        {showValueLabel && (
+          <span className="text-white/58">{qualityButtonValueLabel}</span>
+        )}
+        {YOUTUBE_IFRAME_MANUAL_QUALITY_CONTROL_SUPPORTED && (
+          <ChevronDown className={`h-4 w-4 transition-transform ${isQualityMenuOpen ? 'rotate-180' : ''}`} />
+        )}
       </button>
     </div>
   );
+  };
 
   if (isLoading) {
     return (
@@ -3591,9 +3777,9 @@ export default function SessionPage() {
       }
     : undefined;
   const fullToolbarShellClass = isTabletInlineLayout
-    ? 'w-[clamp(48px,5.6vw,56px)] space-y-[clamp(4px,0.6vh,6px)] rounded-r-[20px] rounded-l-none border border-l-0 border-[#8cfff2]/45 bg-[linear-gradient(180deg,rgba(18,40,46,0.94),rgba(6,14,19,0.98))] px-[clamp(4px,0.6vw,5px)] py-[clamp(5px,0.7vh,6px)] shadow-[0_18px_44px_rgba(0,0,0,0.48),inset_0_1px_0_rgba(146,255,244,0.08)] backdrop-blur-xl'
+    ? 'w-[clamp(48px,5.6vw,56px)] space-y-[clamp(4px,0.6vh,6px)] rounded-r-[20px] rounded-l-none border border-l-0 border-[#8cfff2]/45 bg-[linear-gradient(180deg,rgba(18,40,46,0.98),rgba(6,14,19,0.995))] px-[clamp(4px,0.6vw,5px)] py-[clamp(5px,0.7vh,6px)] shadow-[0_10px_24px_rgba(0,0,0,0.34)]'
     : isTabletTouchLayout
-      ? 'w-[clamp(58px,6.6vw,68px)] max-h-full space-y-[clamp(6px,0.9vh,8px)] rounded-r-[24px] rounded-l-none border border-l-0 border-[#8cfff2]/45 bg-[linear-gradient(180deg,rgba(18,40,46,0.94),rgba(6,14,19,0.98))] px-[clamp(5px,0.8vw,7px)] py-[clamp(6px,1vh,8px)] shadow-[0_22px_60px_rgba(0,0,0,0.52),inset_0_1px_0_rgba(146,255,244,0.08)] backdrop-blur-xl'
+      ? 'w-[clamp(58px,6.6vw,68px)] max-h-full space-y-[clamp(6px,0.9vh,8px)] rounded-r-[24px] rounded-l-none border border-l-0 border-[#8cfff2]/45 bg-[linear-gradient(180deg,rgba(18,40,46,0.98),rgba(6,14,19,0.995))] px-[clamp(5px,0.8vw,7px)] py-[clamp(6px,1vh,8px)] shadow-[0_12px_30px_rgba(0,0,0,0.36)]'
     : 'w-[72px] space-y-2 rounded-[24px] border border-[#8cfff2]/45 bg-[linear-gradient(180deg,rgba(18,40,46,0.92),rgba(6,14,19,0.98))] px-2 py-2 shadow-[0_22px_60px_rgba(0,0,0,0.52),inset_0_1px_0_rgba(146,255,244,0.08)] backdrop-blur-xl';
   const fullToolbarGroupClass = isTabletInlineLayout ? 'space-y-[3px]' : isTabletTouchLayout ? 'space-y-[clamp(4px,0.8vh,6px)]' : 'space-y-1';
   const fullToolbarToolButtonClass = isTabletInlineLayout
@@ -3621,6 +3807,23 @@ export default function SessionPage() {
     : isTabletTouchLayout
       ? 'h-[clamp(18px,2.4vh,20px)] w-[clamp(18px,2.4vh,20px)]'
     : 'w-5 h-5';
+  const topOverlayActionButtonBaseClass = `inline-flex h-9 items-center gap-2 rounded-full border px-3 text-[11px] font-black uppercase tracking-[0.16em] transition-colors ${
+    isTouchLayout
+      ? 'shadow-[0_6px_18px_rgba(0,0,0,0.24)]'
+      : 'backdrop-blur-md shadow-[0_10px_30px_rgba(0,0,0,0.28)]'
+  }`;
+  const playbackControlPanelClass = isTouchLayout
+    ? 'rounded-[24px] border border-[#2d5960]/55 bg-[linear-gradient(180deg,rgba(9,22,29,0.985),rgba(5,12,18,0.97))] px-2.5 py-1.5 shadow-[0_12px_30px_rgba(0,0,0,0.34)] sm:px-3 sm:py-2'
+    : 'rounded-[24px] border border-[#2d5960]/55 bg-[linear-gradient(180deg,rgba(9,22,29,0.98),rgba(5,12,18,0.94))] px-2.5 py-1.5 shadow-[inset_0_1px_0_rgba(255,255,255,0.03)] sm:px-3 sm:py-2';
+  const immersivePlaybackPanelClass = isTouchLayout
+    ? 'pointer-events-auto mx-auto max-w-[1480px] rounded-[24px] border border-[#2d5960]/60 bg-[linear-gradient(180deg,rgba(9,22,29,0.985),rgba(5,12,18,0.965))] px-2.5 py-1.5 shadow-[0_14px_36px_rgba(0,0,0,0.34)] sm:px-3 sm:py-2'
+    : 'pointer-events-auto mx-auto max-w-[1480px] rounded-[24px] border border-[#2d5960]/60 bg-[linear-gradient(180deg,rgba(9,22,29,0.9),rgba(5,12,18,0.84))] px-2.5 py-1.5 shadow-[0_24px_70px_rgba(0,0,0,0.4),inset_0_1px_0_rgba(255,255,255,0.03)] backdrop-blur-xl sm:px-3 sm:py-2';
+  const topOverlayFullscreenButtonClass = `${topOverlayActionButtonBaseClass} ${
+    isImmersiveMode
+      ? 'border-[#74f7e8]/35 bg-[#63f6e7]/16 text-[#c7fffa] hover:bg-[#63f6e7]/22'
+      : 'border-white/14 bg-black/40 text-white/88 hover:bg-black/55'
+  }`;
+  const topOverlayQualityButtonClass = `${topOverlayActionButtonBaseClass} border-white/14 bg-black/40 text-white/88 hover:bg-black/55`;
   const showBoardOverlayHeader = !isDisplayMode;
   const timelineEditorModal = isTimelineEditorOpen ? (
     <div
@@ -3666,7 +3869,16 @@ export default function SessionPage() {
               return (
                 <div
                   key={`timeline-editor-${marker.id}`}
-                  className="flex items-center gap-3 rounded-2xl border border-[#244e54] bg-[#08141b] px-3 py-3"
+                  role="button"
+                  tabIndex={0}
+                  onClick={() => handleTimelineEditorJump(marker)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter' || event.key === ' ') {
+                      event.preventDefault();
+                      handleTimelineEditorJump(marker);
+                    }
+                  }}
+                  className="flex cursor-pointer items-center gap-3 rounded-2xl border border-[#244e54] bg-[#08141b] px-3 py-3 transition-colors hover:bg-[#0d1b24] focus:outline-none focus:ring-2 focus:ring-[#7cf7ea]/60"
                 >
                   <div className="flex h-10 w-10 flex-shrink-0 items-center justify-center rounded-full bg-[#0d2729]">
                     <TimelineMarkerIcon type={marker.type} color={markerStyle.color} />
@@ -3679,7 +3891,10 @@ export default function SessionPage() {
                   </div>
                   <button
                     type="button"
-                    onClick={() => handleTimelineMarkerDelete(marker.id)}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      handleTimelineMarkerDelete(marker.id);
+                    }}
                     className="inline-flex items-center gap-2 rounded-full border border-[#5b2d32] bg-[#261116] px-3 py-2 text-xs font-black uppercase tracking-[0.14em] text-[#ff9aa2] transition-colors hover:bg-[#33161c]"
                   >
                     <Trash2 className="h-4 w-4" />
@@ -3933,12 +4148,21 @@ export default function SessionPage() {
                 </div>
               </div>
             )}
-            <button
-              onClick={handleToggleFullscreen}
-              className="absolute top-3 right-3 z-30 px-3 py-1 rounded bg-black/60 hover:bg-black/80 text-white text-xs"
-            >
-              {isImmersiveMode ? text.exitFullscreen : text.fullscreen}
-            </button>
+            <div className="absolute top-3 right-3 z-30 flex items-center gap-2">
+              {!isImmersiveMode && renderQualityControl('display-quality', {
+                buttonClassName: topOverlayQualityButtonClass,
+                menuAlign: 'right',
+                menuVertical: 'down',
+                showValueLabel: true,
+              })}
+              <button
+                onClick={handleToggleFullscreen}
+                className={topOverlayFullscreenButtonClass}
+              >
+                {isImmersiveMode ? <Minimize2 className="h-4 w-4 flex-shrink-0" /> : <Maximize2 className="h-4 w-4 flex-shrink-0" />}
+                {isImmersiveMode ? text.exitFullscreen : text.fullscreen}
+              </button>
+            </div>
 
             <YouTube
               key={`display-${youtubeHost}`}
@@ -3948,6 +4172,7 @@ export default function SessionPage() {
               iframeClassName="w-full h-full"
               onReady={handlePlayerReady}
               onStateChange={handlePlayerStateChange}
+              onPlaybackQualityChange={handlePlaybackQualityChange}
               onError={handlePlayerError}
               onEnd={handleVideoEnd}
             />
@@ -4076,7 +4301,7 @@ export default function SessionPage() {
 
                     <button
                       onClick={handleToggleFullscreen}
-                      className="inline-flex items-center gap-2 bg-transparent px-0 py-0 text-[11px] font-black uppercase tracking-[0.16em] text-white drop-shadow-[0_2px_8px_rgba(0,0,0,0.75)] transition-opacity hover:opacity-80"
+                      className={topOverlayFullscreenButtonClass}
                     >
                       {isImmersiveMode ? <Minimize2 className="h-4 w-4 flex-shrink-0" /> : <Maximize2 className="h-4 w-4 flex-shrink-0" />}
                       <span className="hidden sm:inline">{isImmersiveMode ? text.exitFullscreen : text.fullscreen}</span>
@@ -4305,6 +4530,7 @@ export default function SessionPage() {
                 iframeClassName="w-full h-full"
                 onReady={handlePlayerReady}
                 onStateChange={handlePlayerStateChange}
+                onPlaybackQualityChange={handlePlaybackQualityChange}
                 onError={handlePlayerError}
                 onEnd={handleVideoEnd}
               />
@@ -4354,7 +4580,7 @@ export default function SessionPage() {
 
               {isImmersiveMode && showImmersiveControls && (
                 <div className="absolute inset-x-0 bottom-0 z-40 p-2 sm:p-2.5 pointer-events-none">
-                  <div className="pointer-events-auto mx-auto max-w-[1480px] rounded-[24px] border border-[#2d5960]/60 bg-[linear-gradient(180deg,rgba(9,22,29,0.9),rgba(5,12,18,0.84))] px-2.5 py-1.5 shadow-[0_24px_70px_rgba(0,0,0,0.4),inset_0_1px_0_rgba(255,255,255,0.03)] backdrop-blur-xl sm:px-3 sm:py-2">
+                  <div className={immersivePlaybackPanelClass}>
                     <div className="relative">
                       <div
                         data-timeline-rail="1"
@@ -4365,7 +4591,7 @@ export default function SessionPage() {
                         onPointerCancel={handleTimelinePointerUp}
                       >
                         <div className="absolute inset-x-2 top-1/2 h-px -translate-y-1/2 bg-[#62f7e8]/20" />
-                        {DECORATIVE_TIMELINE_COLUMNS.map((column) => {
+                        {visibleTimelineColumns.map((column) => {
                           const tone = TIMELINE_TONE_STYLE[column.tone];
                           const isActive = playbackProgress >= column.position;
                           return (
@@ -4509,6 +4735,8 @@ export default function SessionPage() {
                         {text.timelineMarkersButton}
                       </button>
 
+                      {renderBoardControl()}
+
                       {renderQualityControl('imm-broadcast-quality')}
 
                       <div className="flex items-center gap-2 rounded-full border border-[#2c5a61] bg-[#08141b] px-2.5 py-0.5">
@@ -4551,7 +4779,7 @@ export default function SessionPage() {
             </div>
             {!isImmersiveMode && boardOverlay}
 
-            <div className={`${isImmersiveMode ? 'hidden' : ''} rounded-[24px] border border-[#2d5960]/55 bg-[linear-gradient(180deg,rgba(9,22,29,0.98),rgba(5,12,18,0.94))] px-2.5 py-1.5 shadow-[inset_0_1px_0_rgba(255,255,255,0.03)] sm:px-3 sm:py-2`}>
+            <div className={`${isImmersiveMode ? 'hidden' : ''} ${playbackControlPanelClass}`}>
               <div className="relative">
                 <div
                   data-timeline-rail="1"
@@ -4562,7 +4790,7 @@ export default function SessionPage() {
                   onPointerCancel={handleTimelinePointerUp}
                 >
                   <div className="absolute inset-x-2 top-1/2 h-px -translate-y-1/2 bg-[#62f7e8]/20" />
-                  {DECORATIVE_TIMELINE_COLUMNS.map((column) => {
+                  {visibleTimelineColumns.map((column) => {
                     const tone = TIMELINE_TONE_STYLE[column.tone];
                     const isActive = playbackProgress >= column.position;
                     return (
@@ -4704,6 +4932,8 @@ export default function SessionPage() {
                   <PencilLine className="h-4 w-4" />
                   {text.timelineMarkersButton}
                 </button>
+
+                {renderBoardControl()}
 
                 {renderQualityControl('broadcast-quality')}
 

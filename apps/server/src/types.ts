@@ -158,6 +158,14 @@ export interface VideoState {
   lastUpdate: number;
 }
 
+export type TimelineMarkerType = 'goal' | 'dismissal' | 'substitution' | 'foul' | 'freeKick' | 'moment';
+
+export interface TimelineMarker {
+  id: string;
+  time: number;
+  type: TimelineMarkerType;
+}
+
 // Socket event types
 export interface SocketEvents {
   // Session management
@@ -186,6 +194,7 @@ export interface SocketEvents {
   'draw:history': (drawings: Drawing[]) => void;
   'board:state': (state: BoardState) => void;
   'board:visibility': (state: { isOpen: boolean }) => void;
+  'timeline:state': (markers: TimelineMarker[]) => void;
 
   // Errors
   'error': (message: string) => void;
@@ -199,6 +208,7 @@ export interface SessionState {
   drawings: Drawing[];
   boardState: BoardState | null;
   boardOpen: boolean;
+  timelineMarkers: TimelineMarker[];
   owner: User;
 }
 

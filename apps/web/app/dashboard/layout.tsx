@@ -7,6 +7,7 @@ import { useAuthStore } from '@/lib/stores/authStore';
 import { useUiStore } from '@/lib/stores/uiStore';
 import { t } from '@/lib/i18n';
 import { useInactivityLogout } from '@/lib/hooks/useInactivityLogout';
+import { useAuthPresence } from '@/lib/hooks/useAuthPresence';
 
 export default function DashboardLayout({
   children,
@@ -18,6 +19,7 @@ export default function DashboardLayout({
   const { language, setLanguage } = useUiStore();
 
   useInactivityLogout();
+  useAuthPresence();
 
   useEffect(() => {
     checkAuth();

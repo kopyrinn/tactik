@@ -101,6 +101,11 @@ export const authApi = {
     return response.data;
   },
 
+  presence: async (active = true) => {
+    const response = await api.post<ApiResponse<{ active: boolean }>>('/api/auth/presence', { active });
+    return response.data;
+  },
+
   me: async () => {
     const response = await api.get<ApiResponse<User>>('/api/auth/me');
     return response.data;

@@ -124,38 +124,83 @@ export async function deleteUserSession(token: string) {
 // ---------------------------------------------------------------------------
 // Active device tracking per user (stored as JSON array of tokens)
 // ---------------------------------------------------------------------------
+const ACTIVE_SESSION_TTL_SECONDS = 5 * 60;
+
 function getUserSessionsKey(userId: string) {
   return `user:sessions:${userId}`;
 }
 
+function getUserActiveSessionKey(token: string) {
+  return `user:session:active:${token}`;
+}
+
+function parseUserSessionTokens(raw: string | null): string[] {
+  if (!raw) return [];
+
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+
+    return [...new Set(
+      parsed.filter((token): token is string => typeof token === 'string' && token.length > 0)
+    )];
+  } catch {
+    return [];
+  }
+}
+
 export async function addUserActiveSession(userId: string, token: string) {
   const key = getUserSessionsKey(userId);
-  const raw = await storeGet(key);
-  const tokens: string[] = raw ? JSON.parse(raw) : [];
+  const tokens = parseUserSessionTokens(await storeGet(key));
   if (!tokens.includes(token)) tokens.push(token);
-  await storeSet(key, JSON.stringify(tokens));
+  await Promise.all([
+    storeSet(key, JSON.stringify(tokens)),
+    storeSet(getUserActiveSessionKey(token), '1', ACTIVE_SESSION_TTL_SECONDS),
+  ]);
+}
+
+export async function refreshUserActiveSession(userId: string, token: string) {
+  await addUserActiveSession(userId, token);
 }
 
 export async function removeUserActiveSession(userId: string, token: string) {
   const key = getUserSessionsKey(userId);
-  const raw = await storeGet(key);
-  if (!raw) return;
-  const tokens: string[] = JSON.parse(raw).filter((t: string) => t !== token);
-  await storeSet(key, JSON.stringify(tokens));
+  const tokens = parseUserSessionTokens(await storeGet(key)).filter((value) => value !== token);
+
+  await Promise.all([
+    tokens.length > 0
+      ? storeSet(key, JSON.stringify(tokens))
+      : storeDel(key),
+    storeDel(getUserActiveSessionKey(token)),
+  ]);
 }
 
 export async function countUserActiveSessions(userId: string): Promise<number> {
   const key = getUserSessionsKey(userId);
-  const raw = await storeGet(key);
-  if (!raw) return 0;
+  const tokens = parseUserSessionTokens(await storeGet(key));
+  if (tokens.length === 0) {
+    await storeDel(key);
+    return 0;
+  }
 
-  const tokens: string[] = JSON.parse(raw);
   const aliveChecks = await Promise.all(
-    tokens.map((token) => storeExists(`user:session:${token}`))
+    tokens.map(async (token) => {
+      const [hasAuthSession, hasActivePresence] = await Promise.all([
+        storeExists(`user:session:${token}`),
+        storeExists(getUserActiveSessionKey(token)),
+      ]);
+
+      return hasAuthSession && hasActivePresence;
+    })
   );
   const alive = tokens.filter((_, i) => aliveChecks[i]);
 
-  await storeSet(key, JSON.stringify(alive));
+  if (alive.length > 0) {
+    await storeSet(key, JSON.stringify(alive));
+  } else {
+    await storeDel(key);
+  }
+
   return alive.length;
 }
 
@@ -170,12 +215,12 @@ export async function countUserActiveSessionsBulk(userIds: string[]): Promise<Re
 
 export async function deleteAllUserSessions(userId: string) {
   const key = getUserSessionsKey(userId);
-  const raw = await storeGet(key);
-  if (raw) {
-    try {
-      const tokens: string[] = JSON.parse(raw);
-      await Promise.all(tokens.map((token) => storeDel(`user:session:${token}`)));
-    } catch {}
+  const tokens = parseUserSessionTokens(await storeGet(key));
+  if (tokens.length > 0) {
+    await Promise.all(tokens.flatMap((token) => [
+      storeDel(`user:session:${token}`),
+      storeDel(getUserActiveSessionKey(token)),
+    ]));
   }
   await storeDel(key);
 }

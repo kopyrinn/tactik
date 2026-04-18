@@ -1,6 +1,6 @@
 import { Server, Socket } from 'socket.io';
 import jwt from 'jsonwebtoken';
-import type { SessionState, Drawing, VideoState, SessionParticipant, BoardState, BoardPieceLabels } from '../types';
+import type { SessionState, Drawing, VideoState, SessionParticipant, BoardState, BoardPieceLabels, TimelineMarker, TimelineMarkerType } from '../types';
 import { getSessionState, saveSessionState } from '../redis';
 import { incrementDemoMetric, incrementUserUsageMetric, query, queryOne, touchUserUsageActivity } from '../db';
 import { generateId } from '../db';
@@ -9,6 +9,7 @@ import { JWT_SECRET } from '../config';
 // In-memory session state management
 const activeSessions = new Map<string, SessionState>();
 const FALLBACK_DRAWING_COLOR = '#FF4D6D';
+const TIMELINE_MARKER_TYPES = new Set<TimelineMarkerType>(['goal', 'dismissal', 'substitution', 'foul', 'freeKick', 'moment']);
 
 function normalizeSocketColor(value: unknown, fallback = FALLBACK_DRAWING_COLOR) {
   return typeof value === 'string' && /^#[0-9a-f]{6}$/i.test(value) ? value.toUpperCase() : fallback;
@@ -170,6 +171,19 @@ function parseBoardState(rawValue: unknown): BoardState | null {
   }
 }
 
+function normalizeTimelineMarkers(value: unknown): TimelineMarker[] {
+  if (!Array.isArray(value)) return [];
+
+  return value
+    .filter((item): item is Partial<TimelineMarker> => Boolean(item) && typeof item === 'object')
+    .map((item) => ({
+      id: typeof item.id === 'string' && item.id.trim().length > 0 ? item.id : generateId(),
+      time: Number.isFinite(item.time) ? Math.max(0, Number(item.time)) : 0,
+      type: TIMELINE_MARKER_TYPES.has(item.type as TimelineMarkerType) ? item.type as TimelineMarkerType : 'foul',
+    }))
+    .sort((left, right) => left.time - right.time);
+}
+
 function getProjectedVideoState(videoState: VideoState): VideoState {
   const now = Date.now();
   const playbackRate = Number(videoState.playbackRate) > 0 ? Number(videoState.playbackRate) : 1;
@@ -328,6 +342,7 @@ export function setupSocketHandlers(io: Server) {
               ...savedState,
               boardState: (savedState as any).boardState ?? dbBoardState ?? null,
               boardOpen: Boolean((savedState as any).boardOpen),
+              timelineMarkers: normalizeTimelineMarkers((savedState as any).timelineMarkers),
             };
           } else {
             const restoredDrawings = isDemoSession
@@ -354,6 +369,7 @@ export function setupSocketHandlers(io: Server) {
               drawings: restoredDrawings,
               boardState: dbBoardState,
               boardOpen: false,
+              timelineMarkers: [],
               owner: session.owner_id,
             };
           }
@@ -674,6 +690,22 @@ export function setupSocketHandlers(io: Server) {
         }
       } catch (error) {
         console.error('Error clearing drawings:', error);
+      }
+    });
+
+    socket.on('timeline:state', async (data: { sessionId: string; timelineMarkers: TimelineMarker[] }) => {
+      try {
+        const access = joinedSessions.get(data.sessionId);
+        if (!access || access.mode !== 'participant') return;
+
+        const state = activeSessions.get(data.sessionId);
+        if (!state) return;
+
+        state.timelineMarkers = normalizeTimelineMarkers(data.timelineMarkers);
+        io.to(data.sessionId).emit('timeline:state', state.timelineMarkers);
+        await saveSessionState(data.sessionId, state);
+      } catch (error) {
+        console.error('Error syncing timeline markers:', error);
       }
     });
 
